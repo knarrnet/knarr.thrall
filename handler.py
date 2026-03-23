@@ -157,6 +157,18 @@ class ThrallPlugin(PluginHooks):
         self.memory = ThrallMemory(self.db)
         self.actions._structured_memory = self.memory
 
+        # Knowledge-as-a-Service (v3.10)
+        knowledge_cfg = thrall_cfg.get("knowledge", {})
+        self.knowledge_manager = None
+        if knowledge_cfg.get("trust_level", "none") != "disabled":
+            from knowledge import KnowledgeManager
+            self.knowledge_manager = KnowledgeManager(
+                db=self.db,
+                backend=backend,
+                plugin_dir=self._plugin_dir,
+                config=knowledge_cfg,
+            )
+
         # Initialize context gatherer (pre-prompt data fetching)
         self.gatherer = ContextGatherer(
             db=self.db, plugin_dir=self._plugin_dir)
@@ -217,6 +229,8 @@ class ThrallPlugin(PluginHooks):
         self.gatherer.set_memory(self.memory)
         # Wire PluginContext so punchhole gather source can call get_plugin()
         self.gatherer.set_ctx(ctx)
+        if self.knowledge_manager:
+            self.gatherer.set_knowledge_manager(self.knowledge_manager)
 
         # Compilation config
         compile_cfg = config.get("compilation", {})
