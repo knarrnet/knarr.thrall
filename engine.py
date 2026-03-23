@@ -183,8 +183,22 @@ class PipelineEngine:
             try:
                 gather_cfg = recipe["gather"]
                 if isinstance(gather_cfg, list) and gather_cfg and isinstance(gather_cfg[0], str):
-                    # v3.7 catalog fields: gather = ["field1", "field2"]
-                    gathered = await asyncio.to_thread(self._gatherer.gather_fields, gather_cfg)
+                    # Partition: knowledge.* fields vs catalog fields
+                    knowledge_fields = [f for f in gather_cfg
+                                        if f.startswith("knowledge.")]
+                    catalog_fields = [f for f in gather_cfg
+                                      if not f.startswith("knowledge.")]
+
+                    gathered = {}
+                    # Catalog fields (existing path)
+                    if catalog_fields:
+                        gathered.update(await asyncio.to_thread(
+                            self._gatherer.gather_fields, catalog_fields))
+                    # Knowledge fields (new path)
+                    if knowledge_fields:
+                        gathered.update(await asyncio.to_thread(
+                            self._gatherer.gather_knowledge_fields,
+                            knowledge_fields, envelope, recipe))
                 else:
                     # Legacy [[gather]] blocks
                     gathered = await self._gatherer.gather(recipe, envelope)
