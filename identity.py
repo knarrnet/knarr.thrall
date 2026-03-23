@@ -18,6 +18,22 @@ import secrets
 logger = logging.getLogger("thrall.identity")
 
 
+def sign_bytes(signing_key, data: bytes) -> bytes:
+    """Sign raw bytes with an Ed25519 SigningKey. Returns 64-byte signature."""
+    signed = signing_key.sign(data)
+    return signed.signature
+
+
+def verify_bytes(pubkey_hex: str, data: bytes, signature: bytes) -> None:
+    """Verify an Ed25519 signature over raw bytes.
+
+    Raises nacl.exceptions.BadSignatureError on failure.
+    """
+    from nacl.signing import VerifyKey
+    vk = VerifyKey(bytes.fromhex(pubkey_hex))
+    vk.verify(data, signature)
+
+
 class ThrallIdentity:
     """Delegated Ed25519 identity for autonomous thrall operations."""
 
