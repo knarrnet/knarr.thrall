@@ -39,6 +39,12 @@ class ThrallBackend(ABC):
         """Human-readable model identifier."""
         return "unknown"
 
+    def embed(self, text: str) -> list:
+        """Return embedding vector as list of floats.
+        Raises RuntimeError if embedding not supported by this backend.
+        """
+        raise RuntimeError(f"Embedding not available on {self.name} backend")
+
 
 class LocalBackend(ThrallBackend):
     """llama-cpp-python backend. Lazy-loads GGUF model on first call."""
@@ -112,6 +118,14 @@ class LocalBackend(ThrallBackend):
 
         return await asyncio.to_thread(_call)
 
+    def embed(self, text: str) -> list:
+        """Embed text using the loaded GGUF model."""
+        self._ensure_model()
+        if self._llm is None:
+            raise RuntimeError("Local model not available for embedding")
+        result = self._llm.create_embedding(text)
+        return result["data"][0]["embedding"]
+
 
 class OllamaBackend(ThrallBackend):
     """HTTP backend for ollama server. Local or LAN, zero cost."""
@@ -184,6 +198,27 @@ class OllamaBackend(ThrallBackend):
 
         return await asyncio.to_thread(_call)
 
+    def embed(self, text: str) -> list:
+        """Embed text via ollama /api/embed endpoint."""
+        payload = json.dumps({
+            "model": self._model,
+            "input": text,
+        }).encode()
+        req = Request(
+            f"{self._url}/api/embed",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urlopen(req, timeout=self._timeout)
+            data = json.loads(resp.read())
+            embeddings = data.get("embeddings", [])
+            if not embeddings:
+                raise RuntimeError("Empty embedding response from ollama")
+            return embeddings[0]
+        except Exception as e:
+            raise RuntimeError(f"Ollama embed failed: {e}") from e
+
 
 class OpenAIBackend(ThrallBackend):
     """Any OpenAI-compatible API (OpenAI, Gemini via OpenAI compat, vLLM, etc.)."""
@@ -198,6 +233,7 @@ class OpenAIBackend(ThrallBackend):
         # Cost tracking fields (populated after each inference)
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
+        self._embed_available = None
 
     @property
     def name(self) -> str:
@@ -220,6 +256,48 @@ class OpenAIBackend(ThrallBackend):
             return self._call_openai(system_prompt, user_prompt)
 
         return await asyncio.to_thread(_call)
+
+    def _probe_embedding_support(self):
+        """Check if the OpenAI-compatible endpoint supports /v1/embeddings."""
+        if self._embed_available is not None:
+            return self._embed_available
+        try:
+            req = Request(
+                f"{self._url}/embeddings",
+                data=json.dumps({"model": self._model, "input": "probe"}).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
+                },
+            )
+            resp = urlopen(req, timeout=5)
+            data = json.loads(resp.read())
+            self._embed_available = bool(data.get("data"))
+        except Exception:
+            self._embed_available = False
+        return self._embed_available
+
+    def embed(self, text: str) -> list:
+        """Embed text via OpenAI-compatible /v1/embeddings (works with vLLM)."""
+        if not self._probe_embedding_support():
+            raise RuntimeError(
+                f"OpenAI-compatible endpoint {self._url} does not support embeddings"
+            )
+        payload = json.dumps({
+            "model": self._model,
+            "input": text,
+        }).encode()
+        req = Request(
+            f"{self._url}/embeddings",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
+        )
+        resp = urlopen(req, timeout=self._timeout)
+        data = json.loads(resp.read())
+        return data["data"][0]["embedding"]
 
     def _call_openai(self, system_prompt: str, user_prompt: str) -> str:
         body = {
