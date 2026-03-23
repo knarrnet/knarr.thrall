@@ -7,10 +7,13 @@ Three tables:
 """
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ThrallDB:
@@ -123,6 +126,49 @@ class ThrallDB:
         except sqlite3.OperationalError:
             pass  # column already exists
         c.commit()
+
+        # Knowledge-as-a-Service (v3.10)
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS thrall_knowledge (
+                id          INTEGER PRIMARY KEY,
+                domain      TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text  TEXT NOT NULL,
+                embedding   BLOB,
+                version     TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                UNIQUE(domain, source_file, chunk_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_knowledge_domain
+                ON thrall_knowledge(domain);
+
+            CREATE TABLE IF NOT EXISTS thrall_knowledge_meta (
+                domain           TEXT PRIMARY KEY,
+                version          TEXT NOT NULL,
+                description      TEXT,
+                author_node      TEXT,
+                author_pubkey    TEXT,
+                trust_level      TEXT DEFAULT 'none',
+                acquired_at      TEXT NOT NULL,
+                file_count       INTEGER,
+                chunk_count      INTEGER,
+                ingestion_status TEXT DEFAULT 'pending',
+                embedding_model  TEXT DEFAULT ''
+            );
+        """)
+
+        # FTS5 fallback index — always created
+        try:
+            c.executescript("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS thrall_knowledge_fts
+                USING fts5(
+                    chunk_text, domain, source_file,
+                    content='thrall_knowledge', content_rowid='id'
+                );
+            """)
+        except Exception as e:
+            logger.warning(f"FTS5 index creation failed: {e}")
 
     # ── Journal ──
 
