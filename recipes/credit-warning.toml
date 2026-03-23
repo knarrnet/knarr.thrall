@@ -1,0 +1,31 @@
+# Credit system events — hotwire only, no LLM.
+# Compiles routine credit events, wakes on hard limit breaches.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "credit.*"
+
+[filter]
+cooldown_key = "credit-alert"
+cooldown_seconds = 600
+
+[evaluate]
+type = "hotwire"
+default_action = "drop"   # credit.change fires every tick — silence routine noise, only act on specific events
+
+[[evaluate.rules]]
+field = "limit_type"
+pattern = "hard"
+action = "wake"
+
+[[evaluate.rules]]
+field = "event_name"
+pattern = "credit\\.sanctioned"
+action = "wake"
+
+[actions.compile]
+buffer = "credit-alerts"
+summon_threshold = 3
+summon_keywords = ["sanctioned", "exhausted"]

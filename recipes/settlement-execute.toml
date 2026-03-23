@@ -1,0 +1,41 @@
+# settlement-execute — Execute on-chain $KNARR settlement (Solana testnet).
+#
+# Fires when a settlement is accepted by the peer. Builds an SPL token
+# transfer for the $KNARR mint, signs with thrall identity, submits to RPC.
+#
+# This completes the autonomous settlement flow:
+#   settlement-check (hourly) → propose netting → peer accepts →
+#   settlement-execute (this) → BCW detects → payment-finalized confirms
+#
+# Safety: testnet only, wallet ceiling gated, 1h cooldown per peer.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "settlement.confirmed"
+
+[filter]
+cooldown_key = "settle-exec-{{peer}}"
+cooldown_seconds = 3600
+
+[[gather]]
+name = "economy"
+source = "cockpit"
+endpoint = "/api/economy"
+
+[[gather]]
+name = "wallet_status"
+source = "memory"
+format = "summary"
+query = { node_id = "self", skill = "wallet" }
+
+[evaluate]
+type = "hotwire"
+default_action = "execute_settlement"
+
+[actions.execute_settlement]
+skill = "settlement-execute-lite"
+input = { peer_pubkey = "{{peer}}", settle_amount = "{{amount}}", chain = "solana_testnet" }
+timeout = 120
+error_buffer = "settlement-errors"

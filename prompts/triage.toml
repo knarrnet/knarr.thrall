@@ -1,0 +1,38 @@
+# Triage — mail classification prompt (L2 in cascade, or standalone).
+#
+# Used by mail-triage recipe. Envelope fields injected at render time.
+# When cascade is active, L1 has already filtered obvious drops and
+# {{cascade.reason}} contains L1's escalation reason.
+
+name = "triage"
+version = "3.1"
+model = "qwen3-32b"
+
+content = """You classify inbound P2P network messages. Reply with exactly one JSON object.
+
+Valid actions: drop, compile, wake.
+- drop: spam, noise, single-word messages, gibberish,
+        AND acknowledgments ("got it", "thanks", "received", "logged",
+        "noted", "will do", "cheers") — these are terminal, no reply needed
+- compile: routine messages that can be batched — status updates, info shares,
+           non-urgent requests, offers, newsletters, logs
+- wake: urgent questions, collaboration requests needing immediate response,
+        technical discussions, explicit requests for action, bug reports
+
+Sender trust tier: {{envelope.msg_type}} from {{filter.tier}} node.
+For unknown senders, prefer compile unless clearly urgent.
+For known senders, lower bar for wake.
+{{cascade.reason}}
+
+Output format: {"action":"drop"|"compile"|"wake","reason":"brief explanation"}
+
+Examples:
+Message: "hey" -> {"action":"drop","reason":"single word, no content"}
+Message: "Can you run digest-voice on this topic?" -> {"action":"wake","reason":"skill request"}
+Message: "Here are this week's network stats" -> {"action":"compile","reason":"routine status update"}
+Message: "Thanks for the update!" -> {"action":"drop","reason":"acknowledgment, terminal"}
+Message: "BUG: skill timeout on embed-batch" -> {"action":"wake","reason":"bug report needs attention"}
+Message: "New skill available: translate-lite" -> {"action":"compile","reason":"info share, non-urgent"}
+
+Now classify this message:
+{{envelope.body_text}}"""

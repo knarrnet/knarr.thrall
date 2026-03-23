@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data
+thrall.db
+thrall.db-shm
+thrall.db-wal
+thrall.log
+thrall.log.*
+thrall.reload
+thrall_identity.key
+artifacts/
+
+# OS
+.DS_Store
+Thumbs.db

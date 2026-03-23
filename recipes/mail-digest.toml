@@ -1,0 +1,36 @@
+# Mail Digest — compilation-focused recipe for routine mail.
+#
+# Catches mail types that don't match mail-triage (delivery reports, etc.)
+# and any overflow. Everything compiles to the digest buffer.
+# Timer flush summons agent with compiled overview.
+
+mode = "automated"
+
+[trigger]
+type = "on_mail"
+msg_types = ["delivery", "error"]
+
+[filter]
+trust_bypass = false
+cooldown_key = ""
+cooldown_seconds = 0
+
+[evaluate]
+type = "hotwire"
+default_action = "compile"
+
+# Route errors to immediate attention
+[[evaluate.rules]]
+field = "body_text"
+pattern = "(?i)(error|failed|exception|timeout)"
+action = "compile"
+
+[[evaluate.rules]]
+field = "msg_type"
+pattern = "^error$"
+action = "compile"
+
+[actions.compile]
+buffer = "mail-digest"
+summon_threshold = 20
+summon_keywords = ["CRITICAL", "FATAL"]

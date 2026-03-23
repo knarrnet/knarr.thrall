@@ -1,0 +1,25 @@
+# payment-receipt-notify — Send encrypted receipt mail to payer on payment detection.
+#
+# When BCW detects an incoming $KNARR payment, sends a signed confirmation
+# mail back to the paying node. The payer gets proof-of-receipt without
+# needing to poll the chain themselves.
+#
+# Pure composition: BCW event → thrall recipe → knarr-mail.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "payment.received.*"
+
+[filter]
+cooldown_key = "pay-notify-{{tx_hash}}"
+cooldown_seconds = 300
+
+[evaluate]
+type = "hotwire"
+default_action = "notify"
+
+[actions.notify]
+skill = "knarr-mail"
+input = { action = "send", to = "{{from_node_id}}", body = "payment_receipt: {{amount}} {{denom}} received, tx={{tx_hash}}, chain={{chain_id}}, status=confirmed" }

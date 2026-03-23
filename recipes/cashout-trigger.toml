@@ -1,0 +1,48 @@
+# cashout-trigger — Auto-transfer accumulated $KNARR when threshold reached.
+#
+# Fires on payment.finalized events. Gathers wallet balance, checks if
+# accumulated $KNARR exceeds cashout threshold. If so, executes a transfer
+# to the configured cashout address (operator's main wallet).
+#
+# Use case: swarm nodes accumulate $KNARR from settlements, periodically
+# sweep to operator wallet. Or: thrall accumulates earnings, auto-cashes
+# out above a threshold.
+#
+# Safety: cooldown prevents rapid fire, wallet ceiling still applies,
+# testnet only.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "payment.finalized.*"
+
+[filter]
+cooldown_key = "cashout-sweep"
+cooldown_seconds = 3600
+
+[[gather]]
+name = "wallet_balance"
+source = "cockpit"
+endpoint = "/api/economy"
+
+[evaluate]
+type = "hotwire"
+
+[evaluate.conditions]
+cashout_ready = "wallet_balance.knarr_balance >= cashout_threshold"
+
+[evaluate.thresholds]
+cashout_threshold = 50.0
+
+[evaluate.actions]
+cashout_ready = "sweep"
+default = "skip"
+
+[actions.sweep]
+skill = "settlement-execute-lite"
+input = { peer_node_id = "{{cashout_target_node_id}}", settle_amount = "{{sweep_amount}}", chain = "solana_testnet" }
+error_buffer = "cashout-errors"
+
+[actions.skip]
+# Below threshold — do nothing.

@@ -1,0 +1,27 @@
+# Security events — hotwire only, no LLM.
+# Always wakes agent immediately. No batching for security.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "security.*"
+
+[filter]
+cooldown_key = "security-alert"
+cooldown_seconds = 1800   # 30min — security events are periodic protocol noise; real ones are still immediate
+
+[evaluate]
+type = "hotwire"
+default_action = "drop"   # bus events have no content — only explicit rules wake
+
+# Wake on events that carry an actual peer_id or threat field
+[[evaluate.rules]]
+field = "peer_id"
+pattern = ".+"
+action = "wake"
+
+[[evaluate.rules]]
+field = "reason"
+pattern = ".+"
+action = "wake"

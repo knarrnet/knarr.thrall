@@ -1,0 +1,44 @@
+# Mail Triage — primary inbound classification.
+#
+# Every inbound text/offer mail runs through this recipe.
+# Team nodes bypass the LLM entirely (instant wake).
+# Known/unknown nodes get LLM classification.
+# Actions: drop (spam/ack), compile (queue for digest), wake (summon agent now).
+
+mode = "automated"
+
+[trigger]
+type = "on_mail"
+msg_types = ["text", "offer"]
+
+[filter]
+trust_bypass = true          # team tier skips LLM, goes straight to bypass_action
+bypass_action = "wake"       # team mail always wakes
+
+# Per-sender rate limit — prevents LLM flooding from a single node
+rate_limit_window = 60       # seconds
+rate_limit_max = 5           # max messages per sender in window
+rate_limit_action = "compile" # action when rate limited (buffer, don't wake)
+
+# LLM result cache — reuse recent classification for same sender
+cache_ttl = 120              # seconds — reuse LLM decision within 2 min
+
+[evaluate]
+type = "llm"
+prompt = "triage"
+model = "gemma3-1b"
+fallback_action = "compile"  # if LLM fails or queue full, buffer it
+
+[actions.drop]
+# Nothing extra — just log and suppress
+
+[actions.compile]
+buffer = "mail-digest"
+summon_threshold = 10              # 10+ messages -> flush and summon
+summon_keywords = ["BUG", "DOWN", "URGENT", "CRITICAL", "SECURITY"]  # immediate flush
+
+[actions.wake]
+# Direct summon — agent wakes immediately
+
+[actions.reply]
+template = "Message received. Processing."

@@ -1,0 +1,31 @@
+# Swarm probe — autonomous network interaction generator.
+# Discovers skills on the network, picks one, sends mail or calls it.
+# Generates organic protocol traffic for integration testing.
+#
+# Hotwire only — no LLM. The skill handles all logic.
+# Cooldown: 2 minutes — fast enough to keep conversation flowing.
+#
+# v3.7: Catalog gather — economic context for self-regulation.
+# probe_entropy + budget_remaining let the probe skill diversify
+# without a hardcoded guardrail.
+
+mode = "automated"
+
+# Catalog gather: peer_count (status) + economy context (wallet/probe)
+gather = ["peer_count", "daily_spend", "budget_remaining", "probe_entropy"]
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "swarm-probe"
+cooldown_seconds = 120  # 2 minutes between probes
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[actions.act]
+skill = "swarm-probe-lite"
+input = { mode = "auto", scope = "felag" }
+error_buffer = "swarm-probe-errors"

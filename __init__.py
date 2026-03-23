@@ -1,0 +1,1 @@
+# Thrall Switchboard plugin

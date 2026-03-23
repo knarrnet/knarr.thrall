@@ -1,0 +1,152 @@
+# Gather Field Catalog — Thrall v3.6
+# Each field is a named data point that recipes can declare as a dependency.
+# The gather engine reads the field list, deduplicates API calls by source,
+# and formats only the requested fields into context.
+#
+# Recipe usage: gather = ["peer_count", "daily_spend", "worst_position"]
+
+# ── Source: status (/api/status) ───────────────────────────────────────
+
+[fields.peer_count]
+description = "Number of currently connected peers."
+type = "integer"
+cost = "status"
+format = "scalar"
+
+[fields.skill_count]
+description = "Number of skills registered on this node (own + network)."
+type = "integer"
+cost = "status"
+format = "scalar"
+
+[fields.uptime]
+description = "Node uptime in seconds since last restart."
+type = "integer"
+cost = "status"
+format = "scalar, rendered as hours"
+
+[fields.node_version]
+description = "Running knarr version string."
+type = "text"
+cost = "status"
+format = "scalar"
+
+# ── Source: economy (/api/economy) ─────────────────────────────────────
+
+[fields.net_position]
+description = "Sum of all bilateral balances (positive = net creditor, negative = net debtor)."
+type = "float"
+cost = "economy"
+format = "scalar, 2 decimal places"
+
+[fields.worst_position]
+description = "Bilateral peer with the lowest (most negative) balance."
+type = "text"
+cost = "economy"
+format = "peer_id: balance (e.g., de2a60...: -4.20)"
+
+[fields.settlement_candidates]
+description = "Peers where abs(balance) exceeds soft_limit, eligible for settlement."
+type = "table"
+cost = "economy"
+format = "rows: peer_id, balance, soft_limit, utilization_pct"
+
+[fields.credit_floor_peers]
+description = "Peers at or near hard_limit (utilization > 80%)."
+type = "table"
+cost = "economy"
+format = "rows: peer_id, balance, hard_limit, utilization_pct"
+
+[fields.top_skills_by_revenue]
+description = "Top 5 skills by total revenue (tasks_provided * price)."
+type = "table"
+cost = "economy"
+format = "rows: skill_name, revenue, call_count"
+
+[fields.top_skills_by_cost]
+description = "Top 5 skills by total spend (tasks_consumed * price)."
+type = "table"
+cost = "economy"
+format = "rows: skill_name, cost, call_count"
+
+[fields.bilateral_summary]
+description = "All bilateral positions with non-zero balance."
+type = "table"
+cost = "economy"
+format = "rows: peer_id, balance, utilization_pct, tasks_provided, tasks_consumed"
+
+# ── Source: wallet (/api/wallet or internal) ───────────────────────────
+
+[fields.daily_spend]
+description = "Credits consumed in the last 24 hours."
+type = "float"
+cost = "wallet"
+format = "scalar, 2 decimal places"
+
+[fields.budget_remaining]
+description = "Remaining daily budget (ceiling minus daily_spend)."
+type = "float"
+cost = "wallet"
+format = "scalar, 2 decimal places"
+
+[fields.budget_ceiling]
+description = "Configured daily spend ceiling."
+type = "float"
+cost = "wallet"
+format = "scalar, 2 decimal places"
+
+# ── Source: journal (thrall internal DB) ───────────────────────────────
+
+[fields.recent_actions]
+description = "Last 5 thrall actions with timestamps and outcomes."
+type = "table"
+cost = "journal"
+format = "rows: timestamp, recipe, action, outcome"
+
+[fields.action_counts]
+description = "Count of actions by type in last 24 hours."
+type = "table"
+cost = "journal"
+format = "rows: action_type, count"
+
+# ── Source: peers (/api/peers or DHT) ─────────────────────────────────
+
+[fields.peer_list]
+description = "All connected peers with last_seen and skill count."
+type = "table"
+cost = "peers"
+format = "rows: peer_id, host, last_seen_ago, skill_count"
+
+[fields.skill_inventory]
+description = "All network skills grouped by provider node."
+type = "table"
+cost = "peers"
+format = "rows: skill_name, provider_id, price, tags"
+
+[fields.peer_skill_gaps]
+description = "Skills available on other nodes but not on this node."
+type = "table"
+cost = "peers"
+format = "rows: skill_name, provider_count, avg_price"
+
+# ── Source: memory (thrall_memory table) ───────────────────────────────
+
+[fields.recent_settlements]
+description = "Last 10 settlement reviews with peer, outcome, amount, and reasoning."
+type = "table"
+cost = "memory"
+format = "rows: timestamp, peer_id, outcome, amount, reasoning"
+
+# ── Source: probe (computed, no API call) ──────────────────────────────
+
+[fields.probe_entropy]
+description = "Shannon entropy of recent action distribution (higher = more diverse)."
+type = "float"
+cost = "none"
+format = "scalar, 3 decimal places"
+
+[fields.probe_unique_peers]
+description = "Number of unique peers interacted with in last 24 hours."
+type = "integer"
+cost = "none"
+format = "scalar"

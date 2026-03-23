@@ -1,0 +1,43 @@
+# payment-finalized — React to BCW payment finality confirmation.
+#
+# Fires when BCW confirms an on-chain payment reached finality.
+# This closes the settlement loop — marks the bilateral position
+# as settled in memory. The "act" action calls settlement-check-lite
+# in confirm mode to update position tracking.
+#
+# v0.50.0 NOTE (CR-01 / BCW-WM-01): When core ships the
+# payment.finalized.* → ledger credit subscriber, this recipe's
+# role shifts from "workaround credit" to "journal + observe."
+# The skill call should then be removed and the action changed
+# to "log" — thrall records the settlement for decision memory
+# but no longer needs to drive the credit write.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "payment.finalized.*"
+
+[filter]
+cooldown_key = "payment-final-{{tx_hash}}"
+cooldown_seconds = 3600
+
+[[gather]]
+name = "position"
+source = "cockpit"
+endpoint = "/api/ledger"
+
+[[gather]]
+name = "payment_history"
+source = "memory"
+format = "prompt"
+query = { skill = "bcw", limit = "5" }
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[actions.act]
+skill = "settlement-check-lite"
+input = { mode = "confirm", tx_hash = "{{tx_hash}}", counterparty_node_id = "{{counterparty_node_id}}" }
+error_buffer = "settlement-errors"

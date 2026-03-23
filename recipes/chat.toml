@@ -1,0 +1,25 @@
+# Chat — storefront conversational interface.
+#
+# Public chat through thrall pipeline. Action is always "log" (benign).
+# The conversational reply lives in the eval result's "reason" field.
+# Rate-limited to prevent abuse from the public storefront.
+
+mode = "automated"
+
+[trigger]
+type = "on_mail"
+msg_types = ["text"]
+
+[filter]
+trust_bypass = false
+rate_limit_window = 60
+rate_limit_max = 10
+rate_limit_action = "log"
+
+[evaluate]
+type = "llm"
+prompt = "chat"
+fallback_action = "log"
+
+[actions.log]
+# Benign — trace only, no side effects

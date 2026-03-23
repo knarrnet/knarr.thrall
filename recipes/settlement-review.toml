@@ -1,0 +1,62 @@
+# Settlement review — authority decision on settlement_prepared documents.
+#
+# v0.36.0 PluginHook: on_settlement_review
+# Called by the node when a settlement is prepared and needs authority review.
+#
+# Hotwire path: auto-approve when utilization > 80% AND amount < wallet ceiling.
+# LLM path:     evaluate when amount exceeds ceiling OR peer flagged.
+#
+# Returns: countersigned Document (approve) or None (reject).
+# Authority field records decision method (hotwire/llm) + reasoning.
+#
+# v3.7: Uses legacy [[gather]] blocks — needs {{peer_pk}} templating
+# for memory query, which catalog fields don't support.
+
+mode = "automated"
+
+[trigger]
+type = "on_settlement_review"
+
+[filter]
+cooldown_key = "settlement-review:{{peer_pk}}"
+cooldown_seconds = 300    # 5 min per peer
+
+# Legacy gather — needs envelope-templated peer_pk for memory query
+[[gather]]
+name = "economy"
+source = "cockpit"
+endpoint = "/api/economy"
+
+[[gather]]
+name = "positions"
+source = "cockpit"
+endpoint = "/api/positions"
+threshold = "0.6"
+
+[[gather]]
+name = "peer_history"
+source = "memory"
+format = "prompt"
+[gather.query]
+node_id = "{{peer_pk}}"
+skill = "settlement-review"
+limit = "5"
+
+[evaluate]
+type = "hotwire"
+
+# Rule 1: auto-approve if high utilization AND wallet can cover
+[[evaluate.rules]]
+field = "affordable_and_high_util"
+pattern = "true"
+action = "approve"
+
+# Default: approve (most settlements are routine)
+default_action = "approve"
+
+[actions.approve]
+# No skill call needed — handler.on_settlement_review signs directly
+skill = ""
+
+[actions.reject]
+skill = ""

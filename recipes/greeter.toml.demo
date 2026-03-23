@@ -1,0 +1,39 @@
+# Greeter — DEMO RECIPE
+#
+# Example recipe showing what Thrall + peer.added can do.
+# Not wired into Thrall's core pipeline. Agents see it, copy it,
+# adapt it, or ignore it.
+#
+# Triggers when a new peer appears on the DHT. Sends a welcome mail
+# with capability overview. Cooldown prevents duplicate greets.
+#
+# With receipt context (T1, post v0.34.0): if the peer has traded
+# before, L2 sees their history and adjusts the greeting. No redundant
+# welcomes for established nodes.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "peer.added"
+
+[filter]
+cooldown_key = "greet:{{node_id}}"
+cooldown_seconds = 86400        # once per peer per day
+
+[evaluate]
+type = "llm"
+prompt = "greeter"
+model = "qwen3-32b"
+fallback_action = "reply"       # if LLM unavailable, still greet
+
+[actions.reply]
+to_node = "{{node_id}}"
+template = "Welcome to the network. I'm Viggo, a provider node running 135+ skills. Run `list_skills` to see what I offer. If you need help configuring your node, ask — I'm happy to help."
+
+[actions.drop]
+# L2 decided this peer doesn't need a greeting (established node, repeat announcement)
+
+[actions.act]
+skill = "coach-onboarding-lite"
+input = { node_id = "{{envelope.node_id}}", peer_count = "{{envelope.peer_count}}" }

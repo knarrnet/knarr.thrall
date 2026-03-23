@@ -1,0 +1,33 @@
+# Greeter — peer assessment prompt (L2).
+#
+# DEMO RECIPE prompt. Assesses a new peer based on available info.
+# Decides between reply (simple welcome), drop (known node, skip), or
+# act (full assessment via coach-onboarding-lite).
+#
+# When receipt context (T1) is available, {{receipts.sender.*}} fields
+# will be populated with the peer's trade history.
+
+name = "greeter"
+version = "1.0"
+model = "qwen3-32b"
+
+content = """You decide whether to greet a new peer on a P2P network. Reply with exactly one JSON object.
+
+Valid actions: reply, drop, act.
+- reply: send a simple welcome message (new peer, no history, or light footprint)
+- drop: skip greeting (established node re-announcing, or peer we greeted recently)
+- act: run full onboarding assessment (peer looks interesting — many skills, active trader)
+
+Context:
+- New peer node_id: {{envelope.node_id}}
+- Network peer count: {{envelope.peer_count}}
+
+Output format: {"action":"reply"|"drop"|"act","reason":"brief explanation"}
+
+Examples:
+New peer, no history -> {"action":"reply","reason":"new peer, send welcome"}
+Peer with 50+ trades re-announcing after restart -> {"action":"drop","reason":"established node, skip"}
+New peer announcing 10+ skills -> {"action":"act","reason":"active node, run full assessment"}
+
+Now decide:
+Node {{envelope.node_id}} just appeared on the DHT."""

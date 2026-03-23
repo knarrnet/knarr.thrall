@@ -1,0 +1,62 @@
+# wm-review — Generalized Warehouse Manager quarantine review.
+#
+# Fires when WM holds a document for review. Pulls the document from
+# quarantine, evaluates by type, approves or rejects.
+#
+# Settlement documents use hotwire (auto-approve if utilization high +
+# wallet can cover). Unknown types are held for operator (logged as warning).
+# Configuration orders always held.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "wm.document.held"
+
+[filter]
+cooldown_key = "wm-review-{{document_id}}"
+cooldown_seconds = 60
+
+[[gather]]
+name = "quarantine_doc"
+source = "cockpit"
+endpoint = "/api/wm/review/{{document_id}}"
+
+[[gather]]
+name = "wallet_status"
+source = "memory"
+format = "summary"
+query = { node_id = "self", skill = "wallet" }
+
+[evaluate]
+type = "hotwire"
+# Hotwire rules evaluate in order, first match wins.
+# Fields come from the bus event envelope (document_type, document_id, etc.)
+# plus gather results injected as gather.quarantine_doc.* and gather.wallet_status.*
+rules = [
+    # Credit notes: auto-approve (gates 1-4 already passed in WM)
+    { match = "document_type == 'credit_note'", action = "wm_approve" },
+    # Tab reminders: auto-approve
+    { match = "document_type == 'tab_reminder'", action = "wm_approve" },
+    # Settlement prepared: route to settlement-review recipe (already exists)
+    { match = "document_type == 'settlement_prepared'", action = "wm_approve" },
+    # Settlement accepted: auto-approve
+    { match = "document_type == 'settlement_accepted'", action = "wm_approve" },
+    # Payment events from BCW: auto-approve (self-signed, trusted)
+    { match = "document_type == 'payment_received'", action = "wm_approve" },
+    { match = "document_type == 'payment_finalized'", action = "wm_approve" },
+    # Configuration orders: never auto-approve, hold for operator
+    { match = "document_type == 'configuration_order'", action = "log" },
+    # Unknown types: reject with reason
+    { match = "_default", action = "wm_reject" },
+]
+default_action = "log"
+
+[actions.wm_approve]
+# approve action handled by ActionExecutor._do_wm_approve
+
+[actions.wm_reject]
+reason = "Unknown document type held by WM — rejected by thrall policy"
+
+[actions.log]
+# Hold for operator — log but don't approve or reject

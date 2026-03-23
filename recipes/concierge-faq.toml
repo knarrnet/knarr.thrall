@@ -1,0 +1,37 @@
+# Concierge L0 — FAQ / Triage
+#
+# Free tier. Classifies inbound questions and answers FAQs directly.
+# Uses a small/fast LLM for triage. Hotwire rules catch common patterns
+# without needing LLM at all.
+#
+# Actions:
+#   log    — answered directly (FAQ match or LLM response)
+#   compile — question too complex for L0, needs L1 escalation
+#   drop   — spam, gibberish, empty
+
+mode = "automated"
+
+[trigger]
+type = "on_mail"
+msg_types = ["text"]
+
+[filter]
+trust_bypass = false
+rate_limit_window = 60
+rate_limit_max = 20
+rate_limit_action = "log"
+
+[evaluate]
+type = "llm"
+prompt = "concierge-faq"
+fallback_action = "log"
+
+[actions.log]
+# Answered directly — response in eval_result.reason
+
+[actions.compile]
+buffer = "concierge-escalation"
+# Questions that need L1 depth are buffered for review or escalation
+
+[actions.drop]
+# Spam, gibberish, empty messages

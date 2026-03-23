@@ -1,0 +1,26 @@
+# Health Check — runs on every tick cycle.
+#
+# Monitors peer count changes and fires when network looks thin.
+# Uses hotwire rules only (no LLM on tick path).
+
+mode = "automated"
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "health-check"
+cooldown_seconds = 300       # at most once per 5 minutes
+
+[evaluate]
+type = "hotwire"
+default_action = "log"
+
+[[evaluate.rules]]
+field = "peer_count"
+pattern = "^[0-1]$"          # 0 or 1 peers — isolated
+action = "compile"
+
+[actions.compile]
+buffer = "health-alerts"
+summon_threshold = 3          # 3 isolation events → summon

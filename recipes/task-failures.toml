@@ -1,0 +1,21 @@
+# Task failure events — hotwire only, no LLM.
+# Compiles task errors, summons agent after 5 failures accumulate.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "task.failed"
+
+[filter]
+cooldown_key = "task-fail-report"
+cooldown_seconds = 60
+
+[evaluate]
+type = "hotwire"
+default_action = "compile"
+
+[actions.compile]
+buffer = "task-errors"
+summon_threshold = 5
+summon_keywords = ["timeout", "OOM", "SIGSEGV"]

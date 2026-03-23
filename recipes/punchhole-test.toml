@@ -1,0 +1,36 @@
+# Punchhole gather source smoke test.
+#
+# Fires once per hour via on_tick. Reads economy.full and peers.status
+# directly from the punchhole backend in-process — no HTTP polling.
+#
+# When punchhole-backend is not loaded the gather source returns {} and
+# the log message will show empty dicts. This is expected graceful degradation.
+#
+# B3-gather / 2026-03-13
+
+mode = "automated"
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "punchhole-test"
+cooldown_seconds = 3600
+
+[[gather]]
+name = "economy"
+source = "punchhole"
+object = "economy.full"
+
+[[gather]]
+name = "peers"
+source = "punchhole"
+object = "peers.status"
+
+[evaluate]
+type = "hotwire"
+default_action = "log"
+
+[actions.log]
+type = "log"
+message = "Punchhole gather test: economy={{ economy }}, peers={{ peers }}"

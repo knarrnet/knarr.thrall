@@ -1,0 +1,34 @@
+# T7: Strategic Advisor Refresh Trigger
+# Listens for credit warnings and other significant state-change events.
+# On match, calls strategic-advisor-lite with action=reset_cooldown to
+# clear the 6h cooldown key so the advisor fires on the next tick.
+#
+# This ensures that when budget pressure or other material conditions
+# change, the strategy pillar is refreshed promptly rather than waiting
+# for the cooldown to expire naturally.
+#
+# v3.9: Phase D
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "credit.*"
+
+[filter]
+cooldown_key = "strategic-advisor-refresh"
+cooldown_seconds = 300   # 5 min — don't thrash on rapid event bursts
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[[evaluate.rules]]
+field = "event_name"
+pattern = "credit\\.(limit_warning|sanctioned|exhausted|hard_limit)"
+action = "act"
+
+[actions.act]
+skill = "strategic-advisor-lite"
+input = { action = "reset_cooldown", _ts = "{{envelope._ts}}" }
+error_buffer = "strategic-advisor-errors"

@@ -1,0 +1,17 @@
+mode = "automated"
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "cluster-monitor"
+cooldown_seconds = 900   # every 15 minutes
+
+[evaluate]
+type = "hotwire"
+default_action = "monitor"
+
+[actions.monitor]
+skill = "cluster-wallet-monitor-lite"
+input = {}
+error_buffer = "cluster-monitor-errors"

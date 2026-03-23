@@ -1,0 +1,22 @@
+# Cluster health probe — calls a canary skill, logs result.
+# Runs on on_tick, cooldown-throttled to once per 5 minutes.
+# Tests that the cockpit API and skill execution path work end-to-end.
+# Errors are compiled into the "probe-errors" buffer for digest.
+
+mode = "automated"
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "cluster-probe"
+cooldown_seconds = 300          # at most once per 5 minutes
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[actions.act]
+skill = "knarr-mail"
+input = { action = "poll", status_filter = "read", limit = "1" }
+error_buffer = "probe-errors"

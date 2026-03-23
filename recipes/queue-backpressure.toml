@@ -1,0 +1,37 @@
+# Queue backpressure detection — hotwire only, no LLM.
+# Fires when thrall's own LLM queue is saturated or bus events are
+# being dropped at >20%. Wakes agent so it can investigate (model hung,
+# event storm, resource exhaustion).
+#
+# This is a synthetic event emitted by handler.py on_tick, NOT from
+# the node bus. event_name = "thrall.backpressure"
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "thrall.backpressure"
+
+[filter]
+cooldown_key = "queue-backpressure"
+cooldown_seconds = 300
+
+[evaluate]
+type = "hotwire"
+default_action = "compile"
+
+# Queue depth > 0 means coroutines are waiting for the LLM slot
+[[evaluate.rules]]
+field = "queue_depth"
+pattern = "^[1-9]"
+action = "wake"
+
+# Bus drop rate >= 50% means we're losing half our events
+[[evaluate.rules]]
+field = "bus_drop_rate"
+pattern = "^[5-9][0-9]|^100"
+action = "wake"
+
+[actions.compile]
+buffer = "backpressure-alerts"
+summon_threshold = 3

@@ -1,0 +1,49 @@
+# T7: Strategic Advisor Recipe
+# Assembles operational snapshot from punchhole private tier, calls
+# strategic-advisor-lite, writes returned strategy to living memory
+# pillar 92-memory-strategy.md via the skill handler.
+#
+# 6h cooldown. strategic-advisor-refresh.toml clears cooldown on
+# significant state changes (credit warnings, etc.) so the advisor
+# fires fresh on the next tick.
+#
+# v3.9: Phase D — strategic guidance for small swarm nodes.
+#
+# P-003 FIX: peers.status removed from gather.
+# The skill runs on the node itself which has direct DHT access —
+# passing peers.status is redundant AND caused 64KB cockpit limit
+# overflow in 101-node networks (HTTP 413). Economy + positions
+# + skills alone give the advisor full context.
+
+mode = "automated"
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "strategic-advisor"
+cooldown_seconds = 21600   # 6h
+
+[[gather]]
+name = "economy"
+source = "punchhole"
+object = "economy.full"
+
+[[gather]]
+name = "positions"
+source = "punchhole"
+object = "positions.full"
+
+[[gather]]
+name = "skills"
+source = "punchhole"
+object = "skills.inventory"
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[actions.act]
+skill = "strategic-advisor-lite"
+input = { economy = "{{envelope.gather.economy}}", positions = "{{envelope.gather.positions}}", skills = "{{envelope.gather.skills}}", _ts = "{{envelope._ts}}" }
+error_buffer = "strategic-advisor-errors"

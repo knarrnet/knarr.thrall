@@ -1,0 +1,28 @@
+# Concierge L1 — Expert Consultation
+#
+# Priced tier. Deep knowledge base, serious LLM backend.
+# Handles architecture questions, protocol specifics, deployment
+# guidance, and operational troubleshooting.
+#
+# The prompt embeds the full RAG corpus for comprehensive answers.
+# Action is always "log" — the response lives in eval_result.reason.
+
+mode = "automated"
+
+[trigger]
+type = "on_mail"
+msg_types = ["text"]
+
+[filter]
+trust_bypass = false
+rate_limit_window = 60
+rate_limit_max = 10
+rate_limit_action = "log"
+
+[evaluate]
+type = "llm"
+prompt = "concierge-expert"
+fallback_action = "log"
+
+[actions.log]
+# Expert response in eval_result.reason

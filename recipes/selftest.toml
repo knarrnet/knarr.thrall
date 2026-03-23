@@ -1,0 +1,24 @@
+# Autonomous pipeline self-test — runs every 6 hours.
+# Calls thrall-selftest skill via act. If any test fails,
+# the error gets compiled into selftest-failures buffer and
+# the agent is summoned.
+#
+# Hotwire only — no LLM. The skill does the actual work.
+
+mode = "automated"
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "selftest"
+cooldown_seconds = 21600  # 6 hours
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[actions.act]
+skill = "thrall-selftest"
+input = { reload = "true" }
+error_buffer = "selftest-failures"

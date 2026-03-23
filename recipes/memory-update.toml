@@ -1,0 +1,29 @@
+# Memory update — periodic living memory pillar maintenance.
+# Gathers recent activity (actions, economy, settlements) and appends
+# structured observations to the appropriate memory pillar files.
+#
+# Hotwire only — no LLM. The skill handler formats entries from gather data.
+# Cooldown: 15 minutes — frequent enough to capture trends, sparse enough
+# to not overwhelm the pillar files.
+#
+# v3.8: Living memory pillar feature.
+
+mode = "automated"
+
+# Catalog gather: economy + journal + wallet + memory sources
+gather = ["bilateral_summary", "recent_actions", "top_skills_by_revenue", "budget_remaining", "recent_settlements"]
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "memory-update"
+cooldown_seconds = 900    # 15 minutes
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[actions.act]
+skill = "memory-update-lite"
+input = { gather = "{{gather}}" }

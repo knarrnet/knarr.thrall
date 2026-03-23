@@ -1,0 +1,29 @@
+# Concierge L2 — Deep Engagement Intake
+#
+# Premium tier. Does NOT answer the question — collects and packages it.
+# The skill gathers structured input (problem description, context, assets)
+# and logs the package for human review.
+#
+# The requester gets a confirmation that their request was received.
+# The actual response comes later, from a human, via separate channel.
+
+mode = "automated"
+
+[trigger]
+type = "on_mail"
+msg_types = ["text"]
+
+[filter]
+trust_bypass = false
+rate_limit_window = 300
+rate_limit_max = 3
+rate_limit_action = "log"
+
+[evaluate]
+type = "llm"
+prompt = "concierge-intake"
+fallback_action = "log"
+
+[actions.log]
+# Intake confirmation in eval_result.reason
+# Full request logged in thrall journal for human review

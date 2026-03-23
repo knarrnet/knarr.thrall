@@ -1,0 +1,29 @@
+# Settlement position check — autonomous netting proposal generator.
+# Queries bilateral ledger, finds over-threshold positions, signs and
+# submits netting proposals using thrall's delegated identity.
+#
+# Hotwire only — no LLM. Pure computation (ledger query + signing).
+# Cooldown: 1 hour — positions change slowly.
+#
+# v3.7: Catalog-based gather — targeted fields instead of raw API dump.
+
+mode = "automated"
+
+# Catalog gather: 2 API calls (economy + wallet), targeted fields
+gather = ["settlement_candidates", "net_position", "daily_spend"]
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "settlement-check"
+cooldown_seconds = 3600    # hourly
+
+[evaluate]
+type = "hotwire"
+default_action = "act"
+
+[actions.act]
+skill = "settlement-check-lite"
+input = {}
+error_buffer = "settlement-errors"

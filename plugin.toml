@@ -1,0 +1,58 @@
+name = "knarr-thrall"
+version = "3.5.0"
+handler = "handler:ThrallPlugin"
+
+[config]
+enabled = true
+debug = false
+dry_run = false
+ignore_msg_types = ["ack", "delivery", "system"]
+
+[config.thrall]
+enabled = true
+cockpit_token = ""                # your cockpit Bearer token (or use vault)
+backend = "local"                 # local | ollama | openai
+queue_timeout = 5.0               # seconds to wait for LLM slot before fallback
+
+[config.thrall.local]
+model_path = "/path/to/gemma3-1b.gguf"
+n_threads = 2
+n_ctx = 1024
+max_tokens = 128
+
+[config.thrall.cascade]
+enabled = true                    # L1 prefilter before L2
+l1_backend = "local"              # backend type for L1 (local = gemma3:1b CPU)
+l1_prompt = "triage-l1"           # prompt file for L1 (binary drop/escalate)
+
+[config.thrall.ollama]
+url = "http://localhost:11434"
+model = "qwen3:32b"
+temperature = 0.1
+max_tokens = 256
+num_ctx = 2048
+timeout = 30
+
+[config.thrall.openai]
+url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key = ""                      # your API key (or use api_key_vault for vault)
+temperature = 0.1
+max_tokens = 1024
+timeout = 20
+cost_budget_daily = 0             # 0 = unlimited
+
+[config.thrall.identity]
+enabled = false                   # enable delegated Ed25519 keypair
+keyfile = "thrall_identity.key"   # relative to plugin_dir
+
+[config.thrall.wallet]
+ceiling = 50.0                    # max credits per day
+
+[config.thrall.trust_tiers]
+team = []                         # 16-char hex prefix of YOUR other nodes
+known = []                        # 16-char hex prefix of trusted peers
+
+[config.compilation]
+interval_seconds = 3600
+buffer = "mail-digest"

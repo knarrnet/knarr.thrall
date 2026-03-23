@@ -1,0 +1,28 @@
+# payment-received — React to BCW payment detection events.
+#
+# Fires when BCW detects an on-chain payment to one of our addresses.
+# Logs the receipt and records in memory for settlement history.
+# Covers both included-in-block and mempool detection.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "payment.received.*"
+
+[filter]
+cooldown_key = "payment-recv-{{tx_hash}}"
+cooldown_seconds = 300
+
+[[gather]]
+name = "position"
+source = "cockpit"
+endpoint = "/api/ledger"
+
+[evaluate]
+type = "hotwire"
+default_action = "log"
+
+[actions.log]
+# Log is sufficient — BCW handles the receipt writing.
+# Thrall just records in memory for settlement decision context.
