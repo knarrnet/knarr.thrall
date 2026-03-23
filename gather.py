@@ -484,6 +484,44 @@ class ContextGatherer:
     def set_ctx(self, ctx):
         self._ctx = ctx
 
+    def set_knowledge_manager(self, km):
+        self._knowledge_manager = km
+
+    def gather_knowledge_fields(self, field_names: List[str],
+                                envelope: Any = None,
+                                recipe: dict = None) -> Dict[str, str]:
+        """Fetch knowledge fields via similarity search.
+
+        field_names: ["knowledge.casino", "knowledge.trading"]
+        Returns: {"knowledge.casino": "chunk text...", ...}
+        """
+        if not hasattr(self, '_knowledge_manager') or not self._knowledge_manager:
+            return {}
+
+        results = {}
+        # Build query text from envelope or recipe config
+        query_text = ""
+        if envelope and hasattr(envelope, 'fields'):
+            query_text = envelope.fields.get("body_text", "")
+        knowledge_cfg = recipe.get("knowledge", {}) if recipe else {}
+        query_override = knowledge_cfg.get("query", "")
+        top_k = int(knowledge_cfg.get("top_k", 5))
+
+        for field in field_names:
+            if not field.startswith("knowledge."):
+                continue
+            domain = field.split(".", 1)[1]
+            q = query_override or query_text or domain
+            try:
+                result = self._knowledge_manager.query_knowledge(
+                    domain, q, top_k=top_k)
+                results[field] = result
+            except Exception as e:
+                logger.warning(f"GATHER_KNOWLEDGE {domain} failed: {e}")
+                results[field] = ""
+
+        return results
+
     # ── Catalog-based gather (v3.7) ─────────────────────────────────
 
     def gather_fields(self, field_names: List[str]) -> Dict[str, str]:
