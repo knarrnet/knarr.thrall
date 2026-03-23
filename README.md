@@ -101,6 +101,28 @@ Classified decision memory replacing unstructured journals. Every record tagged 
 - Dryrun isolation: `dryrun=1` records excluded from operational queries
 - Two consumers: recipes (via gather stage) and agent plugin (via DB)
 
+### Knowledge-as-a-Service (v3.10.0)
+
+Agents can acquire domain knowledge from the network via skill calls. Knowledge packs contain markdown files + optional recipes, signed with Ed25519.
+
+**Acquire:** Call a knowledge skill (e.g., `knowledge-casino-lite`). Pack is validated (SHA256 + signature), files saved locally, chunks embedded into sqlite-vec (FTS5 fallback).
+
+**Query:** Recipes declare `gather = ["knowledge.casino"]`. During gather stage, top-K relevant chunks are retrieved via similarity search and injected into the prompt.
+
+**Trust levels:**
+- `none` (default) — files saved, no recipes loaded
+- `trusted` — recipes loaded with allowlist validation (only `log` + `act`, hotwire eval, >=300s cooldown)
+- `unsafe` — all recipe actions allowed
+
+**Config:**
+```toml
+[config.thrall.knowledge]
+trust_level = "none"
+max_domains = 50
+max_pack_bytes = 5242880
+embedding_source = "l1"
+```
+
 ### Included Recipes (28)
 
 | Recipe | Trigger | Eval | Purpose |
