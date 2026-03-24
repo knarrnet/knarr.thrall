@@ -160,7 +160,7 @@ class ThrallPlugin(PluginHooks):
         # Knowledge-as-a-Service (v3.10)
         knowledge_cfg = thrall_cfg.get("knowledge", {})
         self.knowledge_manager = None
-        if knowledge_cfg.get("trust_level", "none") != "disabled":
+        if knowledge_cfg.get("trust_level", "none") not in ("disabled", "none"):
             from knowledge import KnowledgeManager
             self.knowledge_manager = KnowledgeManager(
                 db=self.db,
