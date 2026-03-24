@@ -526,5 +526,39 @@ class ThrallDB:
         ).fetchone()
         return dict(row) if row else {}
 
+    # ── Pruning ──
+
+    def prune_journal(self, max_age_seconds: int = 259200) -> int:
+        """Delete journal entries older than max_age. Default 3 days."""
+        cutoff = time.time() - max_age_seconds
+        cur = self._conn.execute(
+            "DELETE FROM thrall_journal WHERE timestamp < ?", (cutoff,))
+        self._conn.commit()
+        return cur.rowcount
+
+    def prune_memory(self, max_age_seconds: int = 604800) -> int:
+        """Delete memory entries older than max_age. Default 7 days."""
+        cutoff = time.time() - max_age_seconds
+        cur = self._conn.execute(
+            "DELETE FROM thrall_memory WHERE timestamp < ?", (cutoff,))
+        self._conn.commit()
+        return cur.rowcount
+
+    def prune_wallet_spend(self, max_age_seconds: int = 604800) -> int:
+        """Delete wallet spend entries older than max_age. Default 7 days."""
+        cutoff = time.time() - max_age_seconds
+        cur = self._conn.execute(
+            "DELETE FROM thrall_wallet_spend WHERE timestamp < ?", (cutoff,))
+        self._conn.commit()
+        return cur.rowcount
+
+    def prune_compilation(self, max_age_seconds: int = 86400) -> int:
+        """Delete compilation buffer entries older than max_age. Default 1 day."""
+        cutoff = time.time() - max_age_seconds
+        cur = self._conn.execute(
+            "DELETE FROM thrall_compilation WHERE created_at < ?", (cutoff,))
+        self._conn.commit()
+        return cur.rowcount
+
     def close(self):
         self._conn.close()

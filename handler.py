@@ -198,6 +198,9 @@ class ThrallPlugin(PluginHooks):
         # Use 127.0.0.1, not localhost — Python urllib on Windows tries IPv6
         # first which adds ~2s per request due to connection timeout fallback
         self._cockpit_url = thrall_cfg.get("cockpit_url", "http://127.0.0.1:8080")
+        self._cockpit_call_timeout = int(thrall_cfg.get("cockpit_call_timeout", 30))
+        self._poll_max_wait = int(thrall_cfg.get("poll_max_wait", 60))
+        self._poll_initial_interval = float(thrall_cfg.get("poll_initial_interval", 2.0))
         self._cockpit_token = ""
         if ctx.vault_get:
             try:
@@ -389,6 +392,20 @@ class ThrallPlugin(PluginHooks):
                 expired = self.db.cleanup_expired_context()
                 if expired > 0:
                     self._log.info(f"Cleaned {expired} expired context entries")
+
+            # Data pruning (every ~30 min)
+            if self._tick_count % 180 == 0:
+                pruned = 0
+                pruned += self.db.prune_journal()
+                pruned += self.db.prune_memory()
+                pruned += self.db.prune_wallet_spend()
+                pruned += self.db.prune_compilation()
+                if pruned > 0:
+                    self._log.info(f"THRALL_PRUNE deleted {pruned} stale rows")
+                # Compact memory pillar files (100 KB cap per file)
+                freed = self._memory_writer.compact_all()
+                if freed > 0:
+                    self._log.info(f"THRALL_PILLAR_COMPACT freed {freed} bytes")
 
             # Check for sentinel reload
             await self._check_reload()
@@ -799,7 +816,7 @@ class ThrallPlugin(PluginHooks):
         payload = json.dumps({
             "skill": skill_name,
             "input": skill_input,
-            "timeout": 120,
+            "timeout": self._cockpit_call_timeout,
         }).encode()
 
         req = Request(
@@ -810,22 +827,25 @@ class ThrallPlugin(PluginHooks):
                 "Authorization": f"Bearer {self._cockpit_token}",
             },
         )
-        resp = urlopen(req, timeout=130, context=ssl_ctx)
+        resp = urlopen(req, timeout=self._cockpit_call_timeout + 5, context=ssl_ctx)
         data = json.loads(resp.read())
         job_id = data.get("job_id")
         if job_id:
             return self._poll_job(job_id, ssl_ctx)
         return data.get("result", data)
 
-    def _poll_job(self, job_id: str, ssl_ctx, max_wait: int = 120) -> dict:
+    def _poll_job(self, job_id: str, ssl_ctx) -> dict:
         """Poll cockpit for async job result.
 
-        Uses progressive backoff: 0.3s for the first few polls (catches fast
-        skills like knarr-mail that complete in <100ms), then ramps to 2s for
-        long-running skills.
+        Configurable via plugin.toml [config.thrall]:
+          poll_max_wait          — max seconds to poll (default 60)
+          poll_initial_interval  — starting interval in seconds (default 2.0)
+
+        Backoff: starts at poll_initial_interval, doubles each poll, caps at 5s.
         """
+        max_wait = self._poll_max_wait
+        interval = self._poll_initial_interval
         deadline = time.time() + max_wait
-        poll_count = 0
         while time.time() < deadline:
             req = Request(
                 f"{self._cockpit_url}/api/jobs/{job_id}",
@@ -841,14 +861,8 @@ class ThrallPlugin(PluginHooks):
                     return {"status": "error", "error": data.get("error", "job failed")}
             except URLError:
                 pass
-            poll_count += 1
-            # Progressive backoff: 0.3s x3, 1s x3, then 2s
-            if poll_count <= 3:
-                time.sleep(0.3)
-            elif poll_count <= 6:
-                time.sleep(1)
-            else:
-                time.sleep(2)
+            time.sleep(interval)
+            interval = min(interval * 1.5, 5.0)  # backoff, cap at 5s
         return {"status": "error", "error": f"job {job_id} timed out after {max_wait}s"}
 
     async def _summon_agent(self, briefing: dict, buffer_name: str,

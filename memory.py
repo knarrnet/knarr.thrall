@@ -265,6 +265,58 @@ class MemoryWriter:
         with open(path, "r", encoding="utf-8") as f:
             return sum(1 for _ in f)
 
+    def compact(self, domain: str, max_bytes: int = 102400) -> int:
+        """Compact a pillar file if it exceeds max_bytes.
+
+        Keeps the header + last 50% of entries (by byte count).
+        Returns bytes freed, or 0 if no compaction needed.
+        """
+        path = self._pillar_path(domain)
+        if not os.path.exists(path):
+            return 0
+        size = os.path.getsize(path)
+        if size <= max_bytes:
+            return 0
+
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Split into header (lines before first ## entry) and entries
+        lines = content.split("\n")
+        header_end = 0
+        for i, line in enumerate(lines):
+            if line.startswith("## ") and i > 0:
+                header_end = i
+                break
+
+        header = "\n".join(lines[:header_end])
+        entries = "\n".join(lines[header_end:])
+
+        # Keep last 50% by character count
+        keep_from = len(entries) // 2
+        # Find the next ## boundary after the midpoint
+        remaining = entries[keep_from:]
+        next_entry = remaining.find("\n## ")
+        if next_entry >= 0:
+            remaining = remaining[next_entry + 1:]  # skip to next entry
+        else:
+            remaining = ""  # nothing to keep
+
+        compacted = header + "\n" + remaining
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(compacted)
+
+        freed = size - len(compacted.encode("utf-8"))
+        logger.info(f"MEMORY_PILLAR_COMPACT {domain}: {size}→{len(compacted)} bytes, freed {freed}")
+        return freed
+
+    def compact_all(self, max_bytes: int = 102400) -> int:
+        """Compact all pillar files. Returns total bytes freed."""
+        total = 0
+        for domain in MEMORY_DOMAINS:
+            total += self.compact(domain, max_bytes)
+        return total
+
     def _make_header(self, domain: str) -> str:
         """Generate initial header for a new pillar file."""
         titles = {

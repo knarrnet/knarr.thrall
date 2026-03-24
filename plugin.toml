@@ -1,5 +1,5 @@
 name = "knarr-thrall"
-version = "3.10.0"
+version = "3.11.0"
 handler = "handler:ThrallPlugin"
 
 [config]
@@ -13,6 +13,9 @@ enabled = true
 cockpit_token = ""                # your cockpit Bearer token (or use vault)
 backend = "local"                 # local | ollama | openai
 queue_timeout = 5.0               # seconds to wait for LLM slot before fallback
+cockpit_call_timeout = 30         # urlopen timeout for /api/execute (seconds)
+poll_max_wait = 60                # max seconds to poll /api/jobs for result
+poll_initial_interval = 2.0       # starting poll interval (seconds), backs off to 5s
 
 [config.thrall.local]
 model_path = "/path/to/gemma3-1b.gguf"
