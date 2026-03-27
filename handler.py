@@ -1030,11 +1030,23 @@ class ThrallPlugin(PluginHooks):
                 }}}},
         ]
 
+        # Add call_own_skill for nodes with special skills (casino hosts etc.)
+        own_skills = sched_cfg.get("own_skills", [])
+        if own_skills:
+            tools.append({"type": "function", "function": {
+                "name": "call_own_skill",
+                "description": f"Call one of YOUR OWN skills: {', '.join(own_skills)}. Use for hosting games, creating content, etc.",
+                "parameters": {"type": "object", "properties": {
+                    "skill_name": {"type": "string", "description": f"One of: {', '.join(own_skills)}"},
+                    "action": {"type": "string", "description": "Action parameter (e.g. 'create', 'status')"},
+                    "reason": {"type": "string"}
+                }, "required": ["skill_name"]}}})
+
         # Action tools — when the LLM calls these, the decision is made
-        action_tools = {"buy_skill", "send_mail", "rest"}
+        action_tools = {"buy_skill", "send_mail", "rest", "call_own_skill"}
 
         messages = [
-            {"role": "user", "content": f"{system}\n\nFirst, gather data you need (query_economy, list_peers, read_memory). Then make your decision (buy_skill, send_mail, or rest)."},
+            {"role": "user", "content": f"{system}\n\nFirst, gather data you need (query_economy, list_peers, read_memory). Then make your decision (buy_skill, send_mail, call_own_skill, or rest)."},
         ]
 
         # Phase 1: Single gather call — LLM can request multiple tools at once
@@ -1184,6 +1196,22 @@ class ThrallPlugin(PluginHooks):
             except Exception as e:
                 return {"action": "send_mail", "outcome": "error",
                         "reason": str(e)[:100]}
+
+        elif name == "call_own_skill":
+            skill_name = args.get("skill_name", "")
+            action = args.get("action", "")
+            reason = args.get("reason", "")
+            if not skill_name:
+                return {"action": "call_own_skill", "outcome": "error",
+                        "reason": "no skill_name"}
+            skill_input = {"action": action} if action else {}
+            try:
+                result = await self._call_skill(skill_name, skill_input)
+                return {"action": "call_own_skill", "outcome": "ok",
+                        "reason": f"{skill_name}({action}): {str(result)[:100]}"}
+            except Exception as e:
+                return {"action": "call_own_skill", "outcome": "error",
+                        "reason": f"{skill_name}: {e}"}
 
         elif name == "buy_skill":
             skill_ref = args.get("skill_name", "")
