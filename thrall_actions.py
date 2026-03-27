@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -105,8 +106,15 @@ class ActionExecutor:
         elif action == "execute_settlement":
             return await self._do_execute_settlement(envelope, eval_result, actions_cfg)
 
+        elif action == "mail_peer":
+            return await self._do_mail_peer(envelope, eval_result, actions_cfg)
+
+        elif actions_cfg.get("skill"):
+            # Dynamic action with skill binding — route to _do_act
+            return await self._do_act(envelope, eval_result, actions_cfg)
+
         else:
-            # Unknown action — treat as log
+            # Unknown action with no skill binding — treat as log
             return ActionResult(action, f"unknown action '{action}', logged")
 
     def _do_log(self, action: str, eval_result: Any, envelope: Any) -> Any:
@@ -500,6 +508,110 @@ class ActionExecutor:
         except Exception as e:
             return ActionResult("reply", f"error: {e}")
 
+
+    def _resolve_node_prefix(self, prefix: str) -> str | None:
+        """Resolve a node_id prefix or peer index to full 64-char hex.
+
+        Accepts: "1" (peer index from scheduler), "e923" (prefix), or full 64-char ID.
+        """
+        prefix = prefix.strip().strip('"').strip("'").lower()
+        if not prefix:
+            return None
+
+        # Check scheduler peer index first (e.g. "1", "2")
+        try:
+            _handler = getattr(self, "_handler", None)
+            if _handler:
+                _idx_map = getattr(_handler, "_sched_peer_index", {})
+                if prefix in _idx_map:
+                    return _idx_map[prefix]
+        except Exception:
+            pass
+
+        # Prefix match against peer table via direct DB access
+        # (NOT cockpit HTTP — that deadlocks the event loop)
+        try:
+            import sqlite3 as _sql_resolve
+            _data_dir = os.environ.get("KNARR_DATA_DIR", "")
+            _db_path = os.path.join(_data_dir, "node.db") if _data_dir else ""
+            if _db_path and os.path.exists(_db_path):
+                _db = _sql_resolve.connect(_db_path)
+                _db.execute("PRAGMA busy_timeout=2000")
+                _row = _db.execute(
+                    "SELECT node_id FROM peers WHERE node_id LIKE ? LIMIT 1",
+                    (prefix + "%",)).fetchone()
+                _db.close()
+                if _row:
+                    return _row[0]
+        except Exception:
+            pass
+        return None
+
+    async def _do_mail_peer(self, envelope: Any, eval_result: Any,
+                             actions_cfg: dict) -> Any:
+        """Send mail to a peer — LLM-composed content.
+
+        The LLM eval result JSON should include:
+            to_node: peer node_id (16-char prefix OK, resolved from peer table)
+            content: message text
+        Falls back to actions_cfg for static overrides.
+        """
+        if not self._send_mail:
+            return ActionResult("mail_peer", "no send_mail_fn configured")
+
+        # Parse to_node and content from LLM eval result
+        try:
+            import json
+            parsed = json.loads(eval_result.raw) if eval_result.raw else {}
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+
+        to_node = (parsed.get("to_node", "")
+                   or actions_cfg.get("to_node", "")
+                   or envelope.get("from_node", ""))
+        content = (parsed.get("content", "")
+                   or actions_cfg.get("content", "")
+                   or eval_result.reason)
+
+        if not to_node:
+            return ActionResult("mail_peer", "no to_node in eval result or config")
+        if not content:
+            return ActionResult("mail_peer", "no content to send")
+
+        # Resolve prefix to full 64-char node_id from peer table
+        if len(to_node) < 64:
+            resolved = self._resolve_node_prefix(to_node)
+            if resolved:
+                to_node = resolved
+            else:
+                return ActionResult("mail_peer",
+                    f"could not resolve prefix {to_node[:16]} to full node_id")
+
+        try:
+            await self._send_mail(
+                to_node, "text",
+                {"type": "text", "content": content},
+                "")
+            logger.info(f"MAIL_PEER sent to={to_node[:16]} len={len(content)}")
+
+            # Record in structured memory
+            if self._structured_memory:
+                self._structured_memory.record(
+                    skill="mail_peer",
+                    node_id=to_node,
+                    outcome="sent",
+                    reasoning=_truncate(content, 200))
+
+            # Record in peers pillar so next decision sees what we already said
+            if self._memory_writer:
+                self._memory_writer.append(
+                    "peers",
+                    f"SENT to {to_node[:16]}: {_truncate(content, 150)}")
+
+            return ActionResult("mail_peer", f"sent to {to_node[:16]}: {_truncate(content, 80)}")
+        except Exception as e:
+            logger.warning(f"MAIL_PEER failed: {e}")
+            return ActionResult("mail_peer_error", f"error: {e}")
 
     async def _do_wm_approve(self, envelope: Any, eval_result: Any,
                               actions_cfg: dict) -> Any:

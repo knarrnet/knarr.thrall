@@ -156,6 +156,7 @@ class ThrallPlugin(PluginHooks):
         # Initialize structured memory and wire to action executor
         self.memory = ThrallMemory(self.db)
         self.actions._structured_memory = self.memory
+        self.actions._handler = self  # for peer index resolution
 
         # Knowledge-as-a-Service (v3.10)
         knowledge_cfg = thrall_cfg.get("knowledge", {})
@@ -261,6 +262,26 @@ class ThrallPlugin(PluginHooks):
                     self._log.warning(f"Bus subscription failed: {e}")
         else:
             self._log.info("Bus API not available (pre-v0.32.0) — bus events disabled")
+
+        # vLLM metrics URL (for scheduler backpressure)
+        _openai_url = thrall_cfg.get("openai", {}).get("url", "")
+        self._vllm_metrics_url = ""
+        if _openai_url and "localhost" in _openai_url:
+            _base = _openai_url.rsplit("/v1", 1)[0] if "/v1" in _openai_url else _openai_url
+            self._vllm_metrics_url = f"{_base}/metrics"
+
+        # Decision scheduler (independent async loop, not tied to on_tick)
+        sched_cfg = thrall_cfg.get("scheduler", {})
+        self._sched_interval = float(sched_cfg.get("decision_interval", 0))
+        self._sched_budget_pct = float(sched_cfg.get("slot_budget_pct", 80))
+        self._sched_tool_use = sched_cfg.get("tool_use", False)
+        self._sched_task = None
+        if self._sched_interval > 0:
+            self._sched_task = asyncio.get_event_loop().create_task(
+                self._decision_scheduler())
+            self._log.info(
+                f"Scheduler started: interval={self._sched_interval}s "
+                f"budget={self._sched_budget_pct}%")
 
     # ── Plugin hooks ──
 
@@ -676,6 +697,474 @@ class ThrallPlugin(PluginHooks):
             except Exception as e:
                 self._log.error(f"Bus consumer error: {e}")
                 await asyncio.sleep(1)
+
+    def _vllm_busy(self) -> bool:
+        """Check vLLM /metrics for queue depth. Returns True if requests are running or waiting."""
+        if not self._vllm_metrics_url:
+            return False
+        try:
+            import urllib.request
+            with urllib.request.urlopen(self._vllm_metrics_url, timeout=2) as resp:
+                for line in resp:
+                    line = line.decode()
+                    if line.startswith("vllm:num_requests_waiting{"):
+                        if float(line.split()[-1]) > 0:
+                            return True
+                    elif line.startswith("vllm:num_requests_running{"):
+                        if float(line.split()[-1]) > 0:
+                            return True
+        except Exception:
+            pass  # metrics unavailable — don't block
+        return False
+
+    # ── Decision scheduler (independent loop) ──
+
+    async def _decision_scheduler(self):
+        """Run scheduled recipes at configurable intervals.
+
+        Independent of on_tick — owns its own timing. Carries context
+        between runs so the LLM sees what it decided last time and what
+        the outcome was. Respects LLM slot budget.
+
+        Config:
+            [config.thrall.scheduler]
+            decision_interval = 300    # seconds between decision cycles
+            slot_budget_pct = 80       # % of LLM capacity for scheduled work
+        """
+        # Wait for node to stabilize before first decision
+        await asyncio.sleep(min(30, self._sched_interval))
+
+        while self._enabled:
+            try:
+                cycle_start = time.time()
+
+                # Backpressure: check vLLM queue before submitting
+                if self._vllm_busy():
+                    if self._debug:
+                        self._log.debug("SCHEDULER_SKIP (vLLM busy)")
+                    await asyncio.sleep(self._sched_interval)
+                    continue
+
+                # Load previous context (what we decided last time)
+                prev_ctx = self.db.get_context("scheduler:decision")
+                last_action = prev_ctx.get("last_action", "none")
+                last_outcome = prev_ctx.get("last_outcome", "none")
+                last_reason = prev_ctx.get("last_reason", "")
+                cycle_count = int(prev_ctx.get("cycle_count", "0"))
+
+                # Pre-fetch peers and economy directly from node DB
+                # (bypass cockpit HTTP — avoids contention and timeouts)
+                _sched_peers = ""
+                _sched_economy = ""
+                try:
+                    import sqlite3 as _sql_sched
+                    _data_dir = os.environ.get("KNARR_DATA_DIR", "")
+                    _db_path = os.path.join(_data_dir, "node.db") if _data_dir else ""
+                    if _db_path and os.path.exists(_db_path):
+                        _sdb = _sql_sched.connect(_db_path)
+                        _sdb.execute("PRAGMA busy_timeout=2000")
+                        # Peers
+                        _rows = _sdb.execute(
+                            "SELECT node_id, host, port FROM peers "
+                            "ORDER BY last_seen DESC LIMIT 20").fetchall()
+                        # Build indexed peer list + lookup table
+                        self._sched_peer_index = {}
+                        if _rows:
+                            _lines = []
+                            for _idx, r in enumerate(_rows, 1):
+                                self._sched_peer_index[str(_idx)] = r[0]
+                                _lines.append(f"[{_idx}] {r[0][:16]}... ({r[1]}:{r[2]})")
+                            _sched_peers = "\n".join(_lines)
+                        # Economy summary
+                        _ledger = _sdb.execute(
+                            "SELECT peer_public_key, balance FROM ledger "
+                            "WHERE balance != 0 LIMIT 20").fetchall()
+                        _net = sum(r[1] for r in _ledger) if _ledger else 0.0
+                        _sched_economy = f"net_position={_net:.1f}, positions={len(_ledger)}"
+                        # Skill inventory — indexed like peers
+                        self._sched_skill_index = {}
+                        try:
+                            _skill_rows = _sdb.execute(
+                                "SELECT DISTINCT skill_key, skill_record_json, "
+                                "provider_node_id FROM skills "
+                                "WHERE is_own=0 LIMIT 30").fetchall()
+                            if _skill_rows:
+                                _skill_lines = []
+                                for _sidx, (_sk, _sj, _sprov) in enumerate(_skill_rows, 1):
+                                    self._sched_skill_index[str(_sidx)] = _sk
+                                    try:
+                                        _sr = __import__('json').loads(_sj)
+                                        _price = _sr.get('price', '?')
+                                    except Exception:
+                                        _price = '?'
+                                    _prov_short = _sprov[:12] if _sprov else '?'
+                                    _skill_lines.append(
+                                        f"[{_sidx}] {_sk} ({_price}cr, from {_prov_short})")
+                                _sched_economy += "\nSkills:\n" + "\n".join(_skill_lines)
+                        except Exception:
+                            pass
+                        _sdb.close()
+                except Exception as _e:
+                    self._log.debug(f"SCHEDULER pre-fetch: {_e}")
+
+                # Read memory pillars (last N entries each)
+                def _read_pillar(domain, n=5):
+                    try:
+                        content = self._memory_writer.read(domain)
+                        if content:
+                            sections = content.split("\n## ")
+                            recent = sections[-n:] if len(sections) > n else sections
+                            return "\n".join(s.strip() for s in recent if s.strip())
+                    except Exception:
+                        pass
+                    return ""
+
+                _strategy_notes = _read_pillar("strategy", 5)
+                _ops_notes = _read_pillar("operations", 3)
+                _peer_notes = _read_pillar("peers", 8)
+
+                envelope = Envelope(
+                    trigger_type="scheduled",
+                    timestamp=time.time(),
+                    fields={
+                        "scheduler": "true",
+                        "cycle_count": str(cycle_count),
+                        "last_action": last_action,
+                        "last_outcome": last_outcome,
+                        "last_reason": last_reason,
+                        "sched_peers": _sched_peers,
+                        "sched_economy": _sched_economy,
+                        "strategy_notes": _strategy_notes,
+                        "ops_notes": _ops_notes,
+                        "peer_notes": _peer_notes,
+                    },
+                )
+
+                # Tool-use mode: multi-turn tool conversation instead of recipe pipeline
+                if self._sched_tool_use:
+                    tool_result = await self._run_tool_decision(
+                        cycle_count, last_action, last_outcome, last_reason,
+                        _sched_peers, _sched_economy,
+                        _strategy_notes, _peer_notes, _ops_notes)
+                    if tool_result:
+                        action = tool_result.get("action", "rest")
+                        outcome = tool_result.get("outcome", "ok")
+                        reason = tool_result.get("reason", "")[:200]
+                        self.db.set_context("scheduler:decision", "last_action", action,
+                                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context("scheduler:decision", "last_outcome", outcome,
+                                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context("scheduler:decision", "last_reason", reason,
+                                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context("scheduler:decision", "cycle_count",
+                                            str(cycle_count + 1), ttl_seconds=None)
+                        try:
+                            self._memory_writer.append(
+                                "strategy",
+                                f"Cycle {cycle_count}: {action} ({outcome}). {reason}")
+                        except Exception:
+                            pass
+                        self._log.info(
+                            f"SCHEDULED tool_decision: cycle={cycle_count} "
+                            f"action={action} outcome={outcome} wall="
+                            f"{int((time.time() - cycle_start) * 1000)}ms")
+
+                    # Sleep until next cycle
+                    elapsed = time.time() - cycle_start
+                    await asyncio.sleep(max(1, self._sched_interval - elapsed))
+                    continue
+
+                matched = self.engine.match_recipes("scheduled", envelope)
+                for recipe_name in matched:
+                    try:
+                        result = await self.engine.run(recipe_name, envelope)
+                        action = result.eval_result.action
+                        outcome = result.action_result.name
+
+                        # Carry context to next cycle
+                        self.db.set_context(
+                            "scheduler:decision", "last_action", action,
+                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context(
+                            "scheduler:decision", "last_outcome", outcome,
+                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context(
+                            "scheduler:decision", "last_reason",
+                            result.eval_result.reason[:200],
+                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context(
+                            "scheduler:decision", "cycle_count",
+                            str(cycle_count + 1),
+                            ttl_seconds=None)  # permanent
+
+                        # Write to strategy pillar (self-improving loop)
+                        try:
+                            self._memory_writer.append(
+                                "strategy",
+                                f"Cycle {cycle_count}: chose {action} "
+                                f"(outcome={outcome}). "
+                                f"Reason: {result.eval_result.reason[:150]}")
+                        except Exception:
+                            pass
+
+                        self._log.info(
+                            f"SCHEDULED {recipe_name}: "
+                            f"cycle={cycle_count} "
+                            f"eval={result.eval_result.eval_type}->{action} "
+                            f"action={outcome} "
+                            f"wall={result.wall_ms}ms")
+                    except Exception as e:
+                        self._log.error(
+                            f"Scheduled pipeline {recipe_name} failed: {e}")
+
+                # Sleep until next cycle
+                elapsed = time.time() - cycle_start
+                sleep_time = max(1, self._sched_interval - elapsed)
+                await asyncio.sleep(sleep_time)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._log.error(f"Scheduler error: {e}")
+                await asyncio.sleep(self._sched_interval)
+
+    # ── Tool-use decision cycle ──
+
+    async def _run_tool_decision(self, cycle_count, last_action, last_outcome,
+                                  last_reason, peers_str, economy_str,
+                                  strategy_notes, peer_notes, ops_notes) -> Optional[dict]:
+        """Multi-turn tool conversation for economic decisions.
+
+        The LLM receives a goal + tools. It calls tools to gather data,
+        then makes a decision by calling an action tool (buy_skill, send_mail, rest).
+        """
+        # Get personality goal from config (or default)
+        sched_cfg = self._config.get("config", {}).get("thrall", {}).get("scheduler", {})
+        goal = sched_cfg.get("goal", "Make smart economic decisions. Trade wisely.")
+
+        # Build system prompt
+        system = (
+            f"You are an autonomous economic agent in a P2P skill network. "
+            f"Cycle {cycle_count}. Last action: {last_action} ({last_outcome}). "
+            f"Your goal: {goal}\n"
+            f"RULES: You earn credits when peers buy YOUR skills. "
+            f"To get peers to buy, you MUST advertise via send_mail first. "
+            f"Buying skills costs credits but builds bilateral relationships. "
+            f"If buy_skill failed last cycle, try send_mail or rest instead. "
+            f"Vary your actions — don't repeat the same action 3x in a row.\n"
+            f"Use tools to check your state, then decide what to do."
+        )
+
+        # Tool definitions
+        tools = [
+            {"type": "function", "function": {
+                "name": "query_economy",
+                "description": "Get current credit balance, bilateral positions, revenue",
+                "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {
+                "name": "list_peers",
+                "description": "Get connected peers with their skills and prices",
+                "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {
+                "name": "read_memory",
+                "description": "Read memory pillar (strategy, peers, or operations notes)",
+                "parameters": {"type": "object", "properties": {
+                    "domain": {"type": "string", "enum": ["strategy", "peers", "operations"]}
+                }, "required": ["domain"]}}},
+            {"type": "function", "function": {
+                "name": "buy_skill",
+                "description": "Buy a skill (costs credits). Use the skill NUMBER from the list, e.g. '1' or '3'",
+                "parameters": {"type": "object", "properties": {
+                    "skill_name": {"type": "string", "description": "Skill number from the list"},
+                    "reason": {"type": "string"}
+                }, "required": ["skill_name"]}}},
+            {"type": "function", "function": {
+                "name": "send_mail",
+                "description": "Send a message to a peer. Use the peer NUMBER from the list, e.g. '1' or '2'",
+                "parameters": {"type": "object", "properties": {
+                    "to_node": {"type": "string", "description": "Peer number from the list"},
+                    "content": {"type": "string"}
+                }, "required": ["to_node", "content"]}}},
+            {"type": "function", "function": {
+                "name": "rest",
+                "description": "Do nothing this cycle (conserve resources)",
+                "parameters": {"type": "object", "properties": {
+                    "reason": {"type": "string"}
+                }}}},
+        ]
+
+        # Action tools — when the LLM calls these, the decision is made
+        action_tools = {"buy_skill", "send_mail", "rest"}
+
+        messages = [
+            {"role": "user", "content": f"{system}\n\nFirst, gather data you need (query_economy, list_peers, read_memory). Then make your decision (buy_skill, send_mail, or rest)."},
+        ]
+
+        # Phase 1: Single gather call — LLM can request multiple tools at once
+        gather_tools = [t for t in tools if t["function"]["name"] not in action_tools]
+        try:
+            result = await asyncio.to_thread(
+                self._vllm_chat_completion, messages, gather_tools)
+            msg = result.get("choices", [{}])[0].get("message", {})
+            tool_calls = msg.get("tool_calls", [])
+
+            if tool_calls:
+                # Add assistant with all tool calls, then all tool results
+                messages.append({"role": "assistant", "content": "",
+                                 "tool_calls": tool_calls})
+                for tc in tool_calls:
+                    fargs = json.loads(tc["function"].get("arguments", "{}")) if tc["function"].get("arguments") else {}
+                    tool_result = self._execute_tool_gather(
+                        tc["function"]["name"], fargs,
+                        peers_str, economy_str, strategy_notes, peer_notes, ops_notes)
+                    messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                     "content": tool_result})
+        except Exception as e:
+            self._log.warning(f"Tool gather failed: {e}")
+
+        # Phase 2: Decide — fresh conversation with gathered data injected as context
+        action_tool_defs = [t for t in tools if t["function"]["name"] in action_tools]
+
+        # Build a clean single-turn message with all data
+        gathered_summary = []
+        for m in messages:
+            if m.get("role") == "tool":
+                gathered_summary.append(m.get("content", ""))
+
+        decide_prompt = (
+            f"{system}\n\n"
+            f"GATHERED DATA:\n" +
+            "\n---\n".join(gathered_summary) +
+            f"\n\nNow choose your action: buy_skill, send_mail, or rest."
+        )
+        messages = [{"role": "user", "content": decide_prompt}]
+
+        try:
+            result = await asyncio.to_thread(
+                self._vllm_chat_completion, messages, action_tool_defs)
+        except Exception as e:
+            self._log.error(f"Tool decision action call failed: {e}")
+            return {"action": "rest", "outcome": "error", "reason": str(e)[:100]}
+
+        if not result:
+            return {"action": "rest", "outcome": "error", "reason": "empty LLM response"}
+
+        msg = result.get("choices", [{}])[0].get("message", {})
+        tool_calls = msg.get("tool_calls", [])
+
+        if not tool_calls:
+            return {"action": "rest", "outcome": "ok",
+                    "reason": msg.get("content", "no tool call")[:200]}
+
+        tc = tool_calls[0]
+        fname = tc["function"]["name"]
+        try:
+            fargs = json.loads(tc["function"]["arguments"])
+        except Exception:
+            fargs = {}
+
+        return await self._execute_tool_action(fname, fargs, tc["id"])
+
+    def _vllm_chat_completion(self, messages, tools) -> dict:
+        """Synchronous vLLM chat completion with tools. Called from to_thread."""
+        import urllib.request
+        openai_cfg = self._config.get("config", {}).get("thrall", {}).get("openai", {})
+        url = openai_cfg.get("url", "http://localhost:8000/v1")
+        model = openai_cfg.get("model", "")
+
+        # Clean messages: vLLM rejects null content in some versions
+        clean_msgs = []
+        for m in messages:
+            cm = dict(m)
+            if cm.get("content") is None:
+                cm["content"] = ""
+            clean_msgs.append(cm)
+
+        body = json.dumps({
+            "model": model,
+            "messages": clean_msgs,
+            "tools": tools,
+            "tool_choice": "required",
+            "max_tokens": 300,
+        }).encode()
+
+        req = urllib.request.Request(
+            f"{url}/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.request.HTTPError as e:
+            error_body = e.read().decode()[:300] if hasattr(e, 'read') else ""
+            raise RuntimeError(f"vLLM {e.code}: {error_body}") from e
+
+    def _execute_tool_gather(self, name, args, peers_str, economy_str,
+                              strategy_notes, peer_notes, ops_notes) -> str:
+        """Execute a data-gathering tool, return result as string."""
+        if name == "query_economy":
+            return economy_str or '{"net_position": 0, "budget_remaining": 0}'
+        elif name == "list_peers":
+            return peers_str or "No peers connected"
+        elif name == "read_memory":
+            domain = args.get("domain", "strategy")
+            if domain == "strategy":
+                return strategy_notes or "(no strategy notes yet)"
+            elif domain == "peers":
+                return peer_notes or "(no peer interaction history)"
+            elif domain == "operations":
+                return ops_notes or "(no operational issues)"
+            return f"(unknown domain: {domain})"
+        return f"(unknown tool: {name})"
+
+    async def _execute_tool_action(self, name, args, tool_call_id) -> dict:
+        """Execute an action tool (buy_skill, send_mail, rest)."""
+        reason = args.get("reason", "")
+
+        if name == "rest":
+            return {"action": "rest", "outcome": "ok", "reason": reason}
+
+        elif name == "send_mail":
+            to_node = args.get("to_node", "")
+            content = args.get("content", "")
+            if not to_node or not content:
+                return {"action": "send_mail", "outcome": "error",
+                        "reason": "missing to_node or content"}
+            # Resolve prefix/index to full node_id
+            resolved = self.actions._resolve_node_prefix(to_node)
+            if not resolved:
+                return {"action": "send_mail", "outcome": "error",
+                        "reason": f"could not resolve {to_node}"}
+            try:
+                await self._send_mail(resolved, "text",
+                                      {"type": "text", "content": content}, "")
+                if self._memory_writer:
+                    self._memory_writer.append(
+                        "peers", f"SENT to {resolved[:16]}: {content[:150]}")
+                return {"action": "send_mail", "outcome": "ok",
+                        "reason": f"sent to {resolved[:16]}: {content[:80]}"}
+            except Exception as e:
+                return {"action": "send_mail", "outcome": "error",
+                        "reason": str(e)[:100]}
+
+        elif name == "buy_skill":
+            skill_ref = args.get("skill_name", "")
+            if not skill_ref:
+                return {"action": "buy_skill", "outcome": "error",
+                        "reason": "no skill_name"}
+            # Resolve index to real skill name
+            skill_name = getattr(self, "_sched_skill_index", {}).get(
+                skill_ref.strip(), skill_ref)
+            try:
+                result = await self._call_skill(skill_name, {})
+                return {"action": "buy_skill", "outcome": "ok",
+                        "reason": f"{skill_name}: {str(result)[:100]}"}
+            except Exception as e:
+                return {"action": "buy_skill", "outcome": "error",
+                        "reason": f"{skill_name}: {e}"}
+
+        return {"action": name, "outcome": "unknown", "reason": "unhandled action"}
 
     # ── Queue backpressure check (runs on tick) ──
 
