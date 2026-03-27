@@ -263,9 +263,6 @@ class ThrallPlugin(PluginHooks):
         else:
             self._log.info("Bus API not available (pre-v0.32.0) — bus events disabled")
 
-        # Error report target (operator node receives mail on failures)
-        self._error_report_node = sched_cfg.get("error_report_node", "")
-
         # vLLM metrics URL (for scheduler backpressure)
         _openai_url = thrall_cfg.get("openai", {}).get("url", "")
         self._vllm_metrics_url = ""
@@ -275,6 +272,7 @@ class ThrallPlugin(PluginHooks):
 
         # Decision scheduler (independent async loop, not tied to on_tick)
         sched_cfg = thrall_cfg.get("scheduler", {})
+        self._error_report_node = sched_cfg.get("error_report_node", "")
         self._sched_interval = float(sched_cfg.get("decision_interval", 0))
         self._sched_budget_pct = float(sched_cfg.get("slot_budget_pct", 80))
         self._sched_tool_use = sched_cfg.get("tool_use", False)
@@ -734,8 +732,10 @@ class ThrallPlugin(PluginHooks):
             decision_interval = 300    # seconds between decision cycles
             slot_budget_pct = 80       # % of LLM capacity for scheduled work
         """
-        # Wait for node to stabilize before first decision
-        await asyncio.sleep(min(30, self._sched_interval))
+        # Wait for node to stabilize + random jitter to desync across cluster
+        import random
+        _jitter = random.uniform(0, min(60, self._sched_interval * 0.3))
+        await asyncio.sleep(min(30, self._sched_interval) + _jitter)
 
         while self._enabled:
             try:
@@ -953,9 +953,10 @@ class ThrallPlugin(PluginHooks):
                         self._log.error(
                             f"Scheduled pipeline {recipe_name} failed: {e}")
 
-                # Sleep until next cycle
+                # Sleep until next cycle + jitter to prevent thundering herd
                 elapsed = time.time() - cycle_start
-                sleep_time = max(1, self._sched_interval - elapsed)
+                _cycle_jitter = random.uniform(0, min(30, self._sched_interval * 0.1))
+                sleep_time = max(1, self._sched_interval - elapsed + _cycle_jitter)
                 await asyncio.sleep(sleep_time)
 
             except asyncio.CancelledError:
