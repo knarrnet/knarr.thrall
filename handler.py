@@ -263,6 +263,9 @@ class ThrallPlugin(PluginHooks):
         else:
             self._log.info("Bus API not available (pre-v0.32.0) — bus events disabled")
 
+        # Error report target (operator node receives mail on failures)
+        self._error_report_node = sched_cfg.get("error_report_node", "")
+
         # vLLM metrics URL (for scheduler backpressure)
         _openai_url = thrall_cfg.get("openai", {}).get("url", "")
         self._vllm_metrics_url = ""
@@ -869,6 +872,22 @@ class ThrallPlugin(PluginHooks):
                             f"action={action} outcome={outcome} wall="
                             f"{int((time.time() - cycle_start) * 1000)}ms")
 
+                        # Mail error reports to operator node
+                        if (outcome in ("error", "act_error")
+                                and self._error_report_node):
+                            try:
+                                _node_id = getattr(
+                                    self, '_node_id',
+                                    os.environ.get("NODE_NAME", "?"))
+                                await self._send_mail(
+                                    self._error_report_node, "text",
+                                    {"type": "text",
+                                     "content": f"[{_node_id}] cycle={cycle_count} "
+                                                 f"{action} FAILED: {reason}"},
+                                    "")
+                            except Exception:
+                                pass
+
                     # Sleep until next cycle
                     elapsed = time.time() - cycle_start
                     await asyncio.sleep(max(1, self._sched_interval - elapsed))
@@ -913,6 +932,23 @@ class ThrallPlugin(PluginHooks):
                             f"eval={result.eval_result.eval_type}->{action} "
                             f"action={outcome} "
                             f"wall={result.wall_ms}ms")
+
+                        # Mail error reports to operator node
+                        if (outcome in ("act_error", "mail_peer_error")
+                                and self._error_report_node):
+                            try:
+                                _node_id = os.environ.get("NODE_NAME", "?")
+                                await self._send_mail(
+                                    self._error_report_node, "text",
+                                    {"type": "text",
+                                     "content": f"[{_node_id}] {recipe_name} "
+                                                 f"cycle={cycle_count} "
+                                                 f"{action} FAILED: "
+                                                 f"{result.eval_result.reason[:100]}"},
+                                    "")
+                            except Exception:
+                                pass
+
                     except Exception as e:
                         self._log.error(
                             f"Scheduled pipeline {recipe_name} failed: {e}")
