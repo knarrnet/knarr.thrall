@@ -1264,9 +1264,17 @@ class ThrallPlugin(PluginHooks):
             if not skill_ref:
                 return {"action": "buy_skill", "outcome": "error",
                         "reason": "no skill_name"}
-            # Resolve index to real skill name
-            skill_name = getattr(self, "_sched_skill_index", {}).get(
-                skill_ref.strip(), skill_ref)
+            # Resolve index to real skill name — also match by substring
+            _idx = getattr(self, "_sched_skill_index", {})
+            skill_name = _idx.get(skill_ref.strip())
+            if not skill_name:
+                # Try matching by name substring
+                for _v in _idx.values():
+                    if skill_ref.strip().lower() in _v.lower():
+                        skill_name = _v
+                        break
+            if not skill_name:
+                skill_name = skill_ref  # fallback to raw name
             try:
                 result = await self._call_skill(skill_name, {})
                 return {"action": "buy_skill", "outcome": "ok",
