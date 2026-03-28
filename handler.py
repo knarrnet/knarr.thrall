@@ -771,10 +771,15 @@ class ThrallPlugin(PluginHooks):
                             "SELECT node_id, host, port FROM peers "
                             "ORDER BY last_seen DESC LIMIT 20").fetchall()
                         # Build indexed peer list + lookup table
+                        # Exclude operator/error_report node from trade targets
                         self._sched_peer_index = {}
+                        _exclude = self._error_report_node[:16] if self._error_report_node else ""
                         if _rows:
                             _lines = []
-                            for _idx, r in enumerate(_rows, 1):
+                            for r in _rows:
+                                if _exclude and r[0].startswith(_exclude):
+                                    continue  # skip operator node
+                                _idx = len(self._sched_peer_index) + 1
                                 self._sched_peer_index[str(_idx)] = r[0]
                                 _lines.append(f"[{_idx}] {r[0][:16]}... ({r[1]}:{r[2]})")
                             _sched_peers = "\n".join(_lines)
