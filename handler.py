@@ -1029,16 +1029,18 @@ class ThrallPlugin(PluginHooks):
                 }, "required": ["domain"]}}},
             {"type": "function", "function": {
                 "name": "buy_skill",
-                "description": "Buy a skill (costs credits). Use the skill NUMBER from the list, e.g. '1' or '3'",
+                "description": "Buy a skill from a peer (costs credits)",
                 "parameters": {"type": "object", "properties": {
-                    "skill_name": {"type": "string", "description": "Skill number from the list"},
+                    "skill_name": {"type": "string",
+                                   "enum": list(getattr(self, "_sched_skill_index", {}).values()) or ["echo"]},
                     "reason": {"type": "string"}
                 }, "required": ["skill_name"]}}},
             {"type": "function", "function": {
                 "name": "send_mail",
-                "description": "Send a message to a peer. Use the peer NUMBER from the list, e.g. '1' or '2'",
+                "description": "Send a message to a peer",
                 "parameters": {"type": "object", "properties": {
-                    "to_node": {"type": "string", "description": "Peer number from the list"},
+                    "to_node": {"type": "string",
+                                "enum": list(getattr(self, "_sched_peer_index", {}).keys()) or ["1"]},
                     "content": {"type": "string"}
                 }, "required": ["to_node", "content"]}}},
             {"type": "function", "function": {
@@ -1264,17 +1266,8 @@ class ThrallPlugin(PluginHooks):
             if not skill_ref:
                 return {"action": "buy_skill", "outcome": "error",
                         "reason": "no skill_name"}
-            # Resolve index to real skill name — also match by substring
-            _idx = getattr(self, "_sched_skill_index", {})
-            skill_name = _idx.get(skill_ref.strip())
-            if not skill_name:
-                # Try matching by name substring
-                for _v in _idx.values():
-                    if skill_ref.strip().lower() in _v.lower():
-                        skill_name = _v
-                        break
-            if not skill_name:
-                skill_name = skill_ref  # fallback to raw name
+            # With enum constraint, skill_ref IS the real skill name
+            skill_name = skill_ref.strip()
             try:
                 result = await self._call_skill(skill_name, {})
                 return {"action": "buy_skill", "outcome": "ok",
