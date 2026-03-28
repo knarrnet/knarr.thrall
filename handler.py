@@ -800,6 +800,7 @@ class ThrallPlugin(PluginHooks):
                             # Get own skill names to filter
                             _own_skills = set(r[0] for r in _sdb.execute(
                                 "SELECT skill_key FROM skills WHERE is_own=1").fetchall())
+                            self._sched_own_skills = _own_skills
                             # Get unique foreign skills (one per name, prefer ones we DON'T have)
                             _skill_rows = _sdb.execute(
                                 "SELECT skill_key, skill_record_json, provider_node_id "
@@ -1032,7 +1033,7 @@ class ThrallPlugin(PluginHooks):
                 "description": "Buy a skill from a peer (costs credits)",
                 "parameters": {"type": "object", "properties": {
                     "skill_name": {"type": "string",
-                                   "enum": list(getattr(self, "_sched_skill_index", {}).values()) or ["echo"]},
+                                   "enum": list(set(getattr(self, "_sched_skill_index", {}).values()) - set(getattr(self, "_sched_own_skills", set()))) or ["echo"]},
                     "reason": {"type": "string"}
                 }, "required": ["skill_name"]}}},
             {"type": "function", "function": {
