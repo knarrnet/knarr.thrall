@@ -789,13 +789,21 @@ class ThrallPlugin(PluginHooks):
                             "WHERE balance != 0 LIMIT 20").fetchall()
                         _net = sum(r[1] for r in _ledger) if _ledger else 0.0
                         _sched_economy = f"net_position={_net:.1f}, positions={len(_ledger)}"
-                        # Skill inventory — indexed like peers
+                        # Skill inventory — one entry per unique skill name, prioritize
+                        # skills this node does NOT own (cross-archetype trades)
                         self._sched_skill_index = {}
                         try:
+                            # Get own skill names to filter
+                            _own_skills = set(r[0] for r in _sdb.execute(
+                                "SELECT skill_key FROM skills WHERE is_own=1").fetchall())
+                            # Get unique foreign skills (one per name, prefer ones we DON'T have)
                             _skill_rows = _sdb.execute(
-                                "SELECT DISTINCT skill_key, skill_record_json, "
-                                "provider_node_id FROM skills "
-                                "WHERE is_own=0 LIMIT 30").fetchall()
+                                "SELECT skill_key, skill_record_json, provider_node_id "
+                                "FROM skills WHERE is_own=0 "
+                                "GROUP BY skill_key ORDER BY skill_key LIMIT 30").fetchall()
+                            # Sort: skills we don't own first (interesting trades), then common ones
+                            _skill_rows = sorted(_skill_rows,
+                                key=lambda r: (r[0] in _own_skills, r[0]))
                             if _skill_rows:
                                 _skill_lines = []
                                 for _sidx, (_sk, _sj, _sprov) in enumerate(_skill_rows, 1):
@@ -990,11 +998,12 @@ class ThrallPlugin(PluginHooks):
             f"Cycle {cycle_count}. Last action: {last_action} ({last_outcome}). "
             f"Your goal: {goal}\n"
             f"RULES: You earn credits when peers buy YOUR skills. "
-            f"Buying skills builds bilateral credit relationships. "
-            f"Use send_mail to negotiate trades, not just advertise. "
-            f"Read knowledge before mailing — use sales tactics. "
-            f"Vary your actions — don't repeat the same action 3x in a row. "
-            f"If you've mailed a peer already, try buying their skills instead.\n"
+            f"BUY skills you DON'T already have — that creates real value. "
+            f"Cheap skills like echo and cluster-state-query are boring — "
+            f"buy creative writing, quality judging, or strategic advice instead. "
+            f"Use send_mail to propose specific trades with peers who have skills you want. "
+            f"Read knowledge before deciding — use negotiation tactics. "
+            f"Vary your actions across buy_skill, send_mail, and rest.\n"
             f"Use tools to check your state, then decide what to do."
         )
 
