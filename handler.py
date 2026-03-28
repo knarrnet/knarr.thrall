@@ -1162,7 +1162,8 @@ class ThrallPlugin(PluginHooks):
             if rag_dir and os.path.isdir(rag_dir):
                 parts = []
                 for fname in sorted(os.listdir(rag_dir)):
-                    if fname.endswith(".md") and fname[0].isdigit():
+                    # Only load strategy files (09+) — docs 01-08 are reference, not tactics
+                    if fname.endswith(".md") and fname[:2] >= "09":
                         try:
                             content = open(os.path.join(rag_dir, fname),
                                            encoding="utf-8").read()
