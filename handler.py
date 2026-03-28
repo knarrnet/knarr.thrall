@@ -742,7 +742,11 @@ class ThrallPlugin(PluginHooks):
                 cycle_start = time.time()
 
                 # Backpressure: check vLLM queue before submitting
-                if self._vllm_busy():
+                try:
+                    busy = await asyncio.to_thread(self._vllm_busy)
+                except Exception:
+                    busy = False
+                if busy:
                     if self._debug:
                         self._log.debug("SCHEDULER_SKIP (vLLM busy)")
                     await asyncio.sleep(self._sched_interval)
