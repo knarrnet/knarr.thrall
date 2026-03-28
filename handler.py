@@ -985,10 +985,11 @@ class ThrallPlugin(PluginHooks):
             f"Cycle {cycle_count}. Last action: {last_action} ({last_outcome}). "
             f"Your goal: {goal}\n"
             f"RULES: You earn credits when peers buy YOUR skills. "
-            f"To get peers to buy, you MUST advertise via send_mail first. "
-            f"Buying skills costs credits but builds bilateral relationships. "
-            f"If buy_skill failed last cycle, try send_mail or rest instead. "
-            f"Vary your actions — don't repeat the same action 3x in a row.\n"
+            f"Buying skills builds bilateral credit relationships. "
+            f"Use send_mail to negotiate trades, not just advertise. "
+            f"Read knowledge before mailing — use sales tactics. "
+            f"Vary your actions — don't repeat the same action 3x in a row. "
+            f"If you've mailed a peer already, try buying their skills instead.\n"
             f"Use tools to check your state, then decide what to do."
         )
 
@@ -1004,9 +1005,9 @@ class ThrallPlugin(PluginHooks):
                 "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {
                 "name": "read_memory",
-                "description": "Read memory pillar (strategy, peers, or operations notes)",
+                "description": "Read memory: strategy (your past decisions), peers (interaction history), operations (failures to avoid), or knowledge (trading tactics and network economics)",
                 "parameters": {"type": "object", "properties": {
-                    "domain": {"type": "string", "enum": ["strategy", "peers", "operations"]}
+                    "domain": {"type": "string", "enum": ["strategy", "peers", "operations", "knowledge"]}
                 }, "required": ["domain"]}}},
             {"type": "function", "function": {
                 "name": "buy_skill",
@@ -1149,6 +1150,30 @@ class ThrallPlugin(PluginHooks):
             error_body = e.read().decode()[:300] if hasattr(e, 'read') else ""
             raise RuntimeError(f"vLLM {e.code}: {error_body}") from e
 
+    _knowledge_cache: str = ""
+
+    def _load_knowledge_corpus(self) -> str:
+        """Load Huginn's business university corpus as strategic knowledge."""
+        if self._knowledge_cache:
+            return self._knowledge_cache
+        # Look for RAG corpus in plugin dir or config dir
+        for base in [self._plugin_dir, os.environ.get("KNARR_CONFIG_DIR", "")]:
+            rag_dir = os.path.join(base, "rag") if base else ""
+            if rag_dir and os.path.isdir(rag_dir):
+                parts = []
+                for fname in sorted(os.listdir(rag_dir)):
+                    if fname.endswith(".md") and fname[0].isdigit():
+                        try:
+                            content = open(os.path.join(rag_dir, fname),
+                                           encoding="utf-8").read()
+                            parts.append(content.strip())
+                        except Exception:
+                            pass
+                if parts:
+                    self._knowledge_cache = "\n\n---\n\n".join(parts)
+                    return self._knowledge_cache
+        return "(no knowledge corpus available — call knowledge skills to acquire)"
+
     def _execute_tool_gather(self, name, args, peers_str, economy_str,
                               strategy_notes, peer_notes, ops_notes) -> str:
         """Execute a data-gathering tool, return result as string."""
@@ -1164,6 +1189,8 @@ class ThrallPlugin(PluginHooks):
                 return peer_notes or "(no peer interaction history)"
             elif domain == "operations":
                 return ops_notes or "(no operational issues)"
+            elif domain == "knowledge":
+                return self._load_knowledge_corpus()
             return f"(unknown domain: {domain})"
         return f"(unknown tool: {name})"
 
