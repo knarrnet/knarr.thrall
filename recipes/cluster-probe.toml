@@ -3,7 +3,7 @@
 # Tests that the cockpit API and skill execution path work end-to-end.
 # Errors are compiled into the "probe-errors" buffer for digest.
 
-mode = "automated"
+mode = "disabled"
 
 [trigger]
 type = "on_tick"

@@ -8,7 +8,7 @@
 #
 # B3-gather / 2026-03-13
 
-mode = "automated"
+mode = "disabled"
 
 [trigger]
 type = "on_tick"

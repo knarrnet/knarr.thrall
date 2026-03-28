@@ -3,7 +3,7 @@
 # Monitors peer count changes and fires when network looks thin.
 # Uses hotwire rules only (no LLM on tick path).
 
-mode = "automated"
+mode = "disabled"
 
 [trigger]
 type = "on_tick"

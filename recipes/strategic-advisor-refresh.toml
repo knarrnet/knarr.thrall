@@ -9,7 +9,7 @@
 #
 # v3.9: Phase D
 
-mode = "automated"
+mode = "disabled"
 
 [trigger]
 type = "on_event"

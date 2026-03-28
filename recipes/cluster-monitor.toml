@@ -1,4 +1,4 @@
-mode = "automated"
+mode = "disabled"
 
 [trigger]
 type = "on_tick"

@@ -7,7 +7,7 @@
 #
 # v3.7: Catalog-based gather — targeted fields instead of raw API dump.
 
-mode = "automated"
+mode = "disabled"
 
 # Catalog gather: 2 API calls (economy + wallet), targeted fields
 gather = ["settlement_candidates", "net_position", "daily_spend"]

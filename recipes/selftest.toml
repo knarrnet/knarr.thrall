@@ -5,7 +5,7 @@
 #
 # Hotwire only — no LLM. The skill does the actual work.
 
-mode = "automated"
+mode = "disabled"
 
 [trigger]
 type = "on_tick"

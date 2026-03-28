@@ -9,7 +9,7 @@
 # probe_entropy + budget_remaining let the probe skill diversify
 # without a hardcoded guardrail.
 
-mode = "automated"
+mode = "disabled"
 
 # Catalog gather: peer_count (status) + economy context (wallet/probe)
 gather = ["peer_count", "daily_spend", "budget_remaining", "probe_entropy"]

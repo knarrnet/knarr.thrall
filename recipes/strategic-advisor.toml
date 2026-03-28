@@ -15,7 +15,7 @@
 # overflow in 101-node networks (HTTP 413). Economy + positions
 # + skills alone give the advisor full context.
 
-mode = "automated"
+mode = "disabled"
 
 [trigger]
 type = "on_tick"

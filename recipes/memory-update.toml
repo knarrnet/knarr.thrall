@@ -8,7 +8,7 @@
 #
 # v3.8: Living memory pillar feature.
 
-mode = "automated"
+mode = "disabled"
 
 # Catalog gather: economy + journal + wallet + memory sources
 gather = ["bilateral_summary", "recent_actions", "top_skills_by_revenue", "budget_remaining", "recent_settlements"]
