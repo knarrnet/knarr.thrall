@@ -1,0 +1,24 @@
+# advisor-consult — Seek strategic advice when in economic trouble.
+#
+# Fires on credit.warning events (balance approaching limits).
+# Calls business-advisor-lite with node_id="self" to trigger
+# self-fetch from local cockpit (real data, no hallucination).
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "credit.warning"
+
+[filter]
+cooldown_key = "advisor-consult"
+cooldown_seconds = 1800
+
+[evaluate]
+type = "hotwire"
+default_action = "consult"
+
+[actions.consult]
+skill = "business-advisor-lite"
+input = { node_id = "self" }
+timeout = 120

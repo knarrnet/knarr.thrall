@@ -1,0 +1,25 @@
+# casino-autocreate — Casino hosts auto-create a game on startup.
+#
+# Fires on first tick after startup. Creates a game and sends mail
+# invitations to peers. This ensures games exist for gamblers to join.
+#
+# Only relevant for casino_host archetype nodes (057-061).
+# Other archetypes should have this recipe disabled or not deployed.
+
+mode = "automated"
+
+[trigger]
+type = "on_tick"
+
+[filter]
+cooldown_key = "casino-autocreate"
+cooldown_seconds = 3600   # one game per hour (600s flooded the bus with skill.registered events)
+
+[evaluate]
+type = "hotwire"
+default_action = "create_game"
+
+[actions.create_game]
+skill = "number-game-host-lite"
+input = { action = "create" }
+error_buffer = "casino-errors"
