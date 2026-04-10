@@ -35,6 +35,7 @@ from wallet import ThrallWallet
 from commerce import ThrallCommerce
 from memory import ThrallMemory, MemoryWriter
 from gather import ContextGatherer
+from checklists import ChecklistManager, Checklist, ChecklistStep
 
 logger = logging.getLogger("thrall")
 
@@ -75,6 +76,8 @@ class ThrallPlugin(PluginHooks):
         self._dry_run = config.get("dry_run", False)
         self._tick_count = 0
         self._processing = False
+        self._start_time = time.time()
+        self._prev_telemetry = {}  # previous snapshot for delta computation
 
         if not self._enabled:
             self._log.info("Thrall switchboard disabled")
@@ -236,6 +239,15 @@ class ThrallPlugin(PluginHooks):
         if self.knowledge_manager:
             self.gatherer.set_knowledge_manager(self.knowledge_manager)
 
+        # Checklist manager — persistent multi-step task execution
+        self._checklist_mgr = ChecklistManager(
+            db=self.db,
+            call_skill_fn=self._call_skill,
+            send_mail_fn=self._send_mail,
+            memory_writer=self._memory_writer,
+            own_node_id=getattr(ctx, "node_id", ""),
+        )
+
         # Compilation config
         compile_cfg = config.get("compilation", {})
         self._compile_interval = compile_cfg.get("interval_seconds", 3600)
@@ -276,6 +288,7 @@ class ThrallPlugin(PluginHooks):
         self._sched_interval = float(sched_cfg.get("decision_interval", 0))
         self._sched_budget_pct = float(sched_cfg.get("slot_budget_pct", 80))
         self._sched_tool_use = sched_cfg.get("tool_use", False)
+        self._sched_decision_mode = sched_cfg.get("decision_mode", "tool_use" if self._sched_tool_use else "recipe")
         self._sched_task = None
         if self._sched_interval > 0:
             self._sched_task = asyncio.get_event_loop().create_task(
@@ -326,6 +339,31 @@ class ThrallPlugin(PluginHooks):
             },
         )
 
+        # ── Casino invitation detection ──
+        # Casino hosts send mail with seat skill names. Parse and store as
+        # a pending opportunity — the LLM decides whether to play during
+        # its next scheduler cycle (sees it in context via pending_invites).
+        if hasattr(self, '_checklist_mgr') and from_node:
+            try:
+                _body_lower = body_text.lower()
+                import re as _re_mail
+                _seat_match = _re_mail.search(r'game-seat-([a-f0-9]+)', _body_lower)
+                if _seat_match:
+                    _game_id = _seat_match.group(1)
+                    _seat_skill = f"game-seat-{_game_id}"
+                    _submit_match = _re_mail.search(r'game-submit-([a-f0-9]+)', _body_lower)
+                    _submit = f"game-submit-{_submit_match.group(1)}" if _submit_match else ""
+                    # Store as pending invite in thrall context (not a checklist yet)
+                    self.db.set_context("casino:invite", _game_id, json.dumps({
+                        "from": from_node, "seat_skill": _seat_skill,
+                        "submit_skill": _submit, "game_id": _game_id,
+                    }), ttl_seconds=600)  # expires in 10 min
+                    self._log.info(
+                        "CASINO_INVITE_DETECTED from=%s game=%s seat=%s",
+                        from_node[:16], _game_id, _seat_skill)
+            except Exception as _cl_mail_err:
+                self._log.debug("CASINO_MAIL_ERR: %s", _cl_mail_err)
+
         # Match recipes
         matched = self.engine.match_recipes("on_mail", envelope)
         if not matched:
@@ -351,6 +389,29 @@ class ThrallPlugin(PluginHooks):
                 )
             except Exception as e:
                 self._log.error(f"Pipeline {recipe_name} failed: {e}")
+
+        # ACK processed mail — mark as read so inbox doesn't grow unbounded
+        try:
+            import sqlite3 as _sql_ack
+            _data_dir = os.environ.get("KNARR_DATA_DIR", "")
+            _db_path = os.path.join(_data_dir, "node.db") if _data_dir else ""
+            # Fallback: look relative to plugin dir
+            if not _db_path or not os.path.exists(_db_path):
+                _db_path = os.path.join(self._plugin_dir, "..", "..", "..", "data", "node.db")
+                _db_path = os.path.normpath(_db_path)
+            if _db_path and os.path.exists(_db_path):
+                _adb = _sql_ack.connect(_db_path)
+                _adb.execute("PRAGMA busy_timeout=1000")
+                _adb.execute(
+                    "UPDATE mail_inbox SET status = 'read' "
+                    "WHERE rowid = (SELECT rowid FROM mail_inbox "
+                    "WHERE from_node = ? AND status = 'unread' "
+                    "ORDER BY rowid DESC LIMIT 1)",
+                    (from_node,))
+                _adb.commit()
+                _adb.close()
+        except Exception:
+            pass
 
     async def on_tick(self, peers: List[NodeInfo], health: NodeHealth) -> None:
         """Called on every node tick (~10s). Handles timers and cleanup."""
@@ -673,7 +734,10 @@ class ThrallPlugin(PluginHooks):
                     continue
 
                 self._bus_events_processed += 1
-
+                # FIX-5 DEBUG: trace settlement.confirmed events
+                if "settlement" in event_name.lower():
+                    self._log.warning(
+                        f"BUS_SETTLE_DEBUG event={event_name} fields={event}")
                 envelope = Envelope(
                     trigger_type="on_event",
                     timestamp=time.time(),
@@ -685,6 +749,9 @@ class ThrallPlugin(PluginHooks):
                 )
 
                 matched = self.engine.match_recipes("on_event", envelope)
+                if "settlement" in event_name.lower():
+                    self._log.warning(
+                        f"BUS_SETTLE_DEBUG matched={matched} envelope_fields={list(envelope.fields.keys())}")
                 for recipe_name in matched:
                     try:
                         result = await self.engine.run(recipe_name, envelope)
@@ -697,26 +764,29 @@ class ThrallPlugin(PluginHooks):
                         self._log.error(f"Bus pipeline {recipe_name} failed: {e}")
             except Exception as e:
                 self._log.error(f"Bus consumer error: {e}")
-                await asyncio.sleep(1)
 
-    def _vllm_busy(self) -> bool:
-        """Check vLLM /metrics for queue depth. Returns True if requests are running or waiting."""
+    def _vllm_busy(self) -> dict:
+        """Check vLLM /metrics for queue depth.
+
+        Returns dict with running/waiting counts. Empty dict if metrics unavailable.
+        Caller checks if busy based on waiting > 0.
+        """
         if not self._vllm_metrics_url:
-            return False
+            return {}
         try:
             import urllib.request
+            running = 0.0
+            waiting = 0.0
             with urllib.request.urlopen(self._vllm_metrics_url, timeout=2) as resp:
                 for line in resp:
                     line = line.decode()
                     if line.startswith("vllm:num_requests_waiting{"):
-                        if float(line.split()[-1]) > 0:
-                            return True
+                        waiting = float(line.split()[-1])
                     elif line.startswith("vllm:num_requests_running{"):
-                        if float(line.split()[-1]) > 0:
-                            return True
+                        running = float(line.split()[-1])
+            return {"running": int(running), "waiting": int(waiting)}
         except Exception:
-            pass  # metrics unavailable — don't block
-        return False
+            return {}  # metrics unavailable — don't block
 
     # ── Decision scheduler (independent loop) ──
 
@@ -734,8 +804,11 @@ class ThrallPlugin(PluginHooks):
         """
         # Wait for node to stabilize + random jitter to desync across cluster
         import random
-        _jitter = random.uniform(0, min(60, self._sched_interval * 0.3))
-        await asyncio.sleep(min(30, self._sched_interval) + _jitter)
+        _jitter = random.uniform(0, min(10, self._sched_interval * 0.3))
+        _initial_wait = min(10, self._sched_interval) + _jitter
+        self._log.info("SCHEDULER_WAIT initial=%.0fs jitter=%.0fs", _initial_wait, _jitter)
+        await asyncio.sleep(_initial_wait)
+        self._log.info("SCHEDULER_LOOP entering loop, enabled=%s", self._enabled)
 
         while self._enabled:
             try:
@@ -743,14 +816,21 @@ class ThrallPlugin(PluginHooks):
 
                 # Backpressure: check vLLM queue before submitting
                 try:
-                    busy = await asyncio.to_thread(self._vllm_busy)
+                    qstats = await asyncio.to_thread(self._vllm_busy)
                 except Exception:
-                    busy = False
-                if busy:
-                    if self._debug:
-                        self._log.debug("SCHEDULER_SKIP (vLLM busy)")
+                    qstats = {}
+                _q_running = qstats.get("running", 0)
+                _q_waiting = qstats.get("waiting", 0)
+                if _q_waiting > 0:
+                    self._log.info(
+                        "SCHEDULER_SKIP backpressure: running=%d waiting=%d",
+                        _q_running, _q_waiting)
                     await asyncio.sleep(self._sched_interval)
                     continue
+                elif _q_running > 0 and self._debug:
+                    self._log.debug(
+                        "SCHEDULER queue: running=%d waiting=%d (proceeding)",
+                        _q_running, _q_waiting)
 
                 # Load previous context (what we decided last time)
                 prev_ctx = self.db.get_context("scheduler:decision")
@@ -770,10 +850,13 @@ class ThrallPlugin(PluginHooks):
                     if _db_path and os.path.exists(_db_path):
                         _sdb = _sql_sched.connect(_db_path)
                         _sdb.execute("PRAGMA busy_timeout=2000")
-                        # Peers
-                        _rows = _sdb.execute(
+                        # Peers — Fix B: random sample each cycle for variety
+                        _all_peers = _sdb.execute(
                             "SELECT node_id, host, port FROM peers "
-                            "ORDER BY last_seen DESC LIMIT 20").fetchall()
+                            "ORDER BY last_seen DESC LIMIT 50").fetchall()
+                        import random as _rnd_peers
+                        _rnd_peers.shuffle(_all_peers)
+                        _rows = _all_peers[:20]
                         # Build indexed peer list + lookup table
                         # Exclude operator/error_report node from trade targets
                         self._sched_peer_index = {}
@@ -785,7 +868,17 @@ class ThrallPlugin(PluginHooks):
                                     continue  # skip operator node
                                 _idx = len(self._sched_peer_index) + 1
                                 self._sched_peer_index[str(_idx)] = r[0]
-                                _lines.append(f"[{_idx}] {r[0][:16]}... ({r[1]}:{r[2]})")
+                                # Enrich with peer's skills
+                                _peer_skills = []
+                                try:
+                                    _ps = _sdb.execute(
+                                        "SELECT skill_key FROM skills WHERE provider_node_id=? LIMIT 5",
+                                        (r[0],)).fetchall()
+                                    _peer_skills = [s[0] for s in _ps]
+                                except Exception:
+                                    pass
+                                _skill_tag = f" skills=[{', '.join(_peer_skills)}]" if _peer_skills else ""
+                                _lines.append(f"[{_idx}] {r[0][:16]}...{_skill_tag}")
                             _sched_peers = "\n".join(_lines)
                         # Economy summary
                         _ledger = _sdb.execute(
@@ -793,6 +886,8 @@ class ThrallPlugin(PluginHooks):
                             "WHERE balance != 0 LIMIT 20").fetchall()
                         _net = sum(r[1] for r in _ledger) if _ledger else 0.0
                         _sched_economy = f"net_position={_net:.1f}, positions={len(_ledger)}"
+                        self._sched_economy = _sched_economy
+                        self._sched_peers_summary = _sched_peers[:300] if _sched_peers else ""
                         # Skill inventory — one entry per unique skill name, prioritize
                         # skills this node does NOT own (cross-archetype trades)
                         self._sched_skill_index = {}
@@ -828,12 +923,29 @@ class ThrallPlugin(PluginHooks):
                 except Exception as _e:
                     self._log.debug(f"SCHEDULER pre-fetch: {_e}")
 
-                # Read memory pillars (last N entries each)
+                # Read memory pillars — deduplicate consecutive rest entries
                 def _read_pillar(domain, n=5):
                     try:
                         content = self._memory_writer.read(domain)
                         if content:
                             sections = content.split("\n## ")
+                            # Fix A: Collapse consecutive "rest" entries into a count
+                            if domain == "strategy":
+                                deduped = []
+                                rest_streak = 0
+                                for s in sections:
+                                    if "rest (ok)" in s and "rest" in s.lower():
+                                        rest_streak += 1
+                                    else:
+                                        if rest_streak > 1:
+                                            deduped.append(f"[Rested for {rest_streak} consecutive cycles]")
+                                        elif rest_streak == 1:
+                                            deduped.append(sections[len(deduped)] if deduped else s)
+                                        rest_streak = 0
+                                        deduped.append(s)
+                                if rest_streak > 1:
+                                    deduped.append(f"[Rested for {rest_streak} consecutive cycles — consider taking action]")
+                                sections = deduped
                             recent = sections[-n:] if len(sections) > n else sections
                             return "\n".join(s.strip() for s in recent if s.strip())
                     except Exception:
@@ -861,8 +973,38 @@ class ThrallPlugin(PluginHooks):
                     },
                 )
 
+                # ── Checklists: advance structured tasks (no LLM cost) ──
+                try:
+                    cl_advanced = await self._checklist_mgr.advance_structured()
+                    if cl_advanced:
+                        self._log.info("CHECKLIST_TICK advanced=%d", cl_advanced)
+                    # Cleanup stale checklists every 10 cycles
+                    if cycle_count % 10 == 0:
+                        self._checklist_mgr.cleanup()
+                except Exception as _cl_err:
+                    self._log.debug("CHECKLIST_ERR: %s", _cl_err)
+
+                # Decision mode dispatch
+                if self._sched_decision_mode == "scored_menu":
+                    tool_result = await self._run_scored_menu_decision(
+                        cycle_count, last_action, last_outcome, last_reason,
+                        _sched_peers, _sched_economy)
+                    if tool_result:
+                        action = tool_result.get("action", "rest")
+                        outcome = tool_result.get("outcome", "ok")
+                        reason = tool_result.get("reason", "")[:200]
+                        self.db.set_context("scheduler:decision", "last_action", action,
+                                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context("scheduler:decision", "last_outcome", outcome,
+                                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context("scheduler:decision", "last_reason", reason,
+                                            ttl_seconds=int(self._sched_interval * 3))
+                        self.db.set_context("scheduler:decision", "cycle_count",
+                                            str(cycle_count + 1),
+                                            ttl_seconds=int(self._sched_interval * 10))
+
                 # Tool-use mode: multi-turn tool conversation instead of recipe pipeline
-                if self._sched_tool_use:
+                elif self._sched_tool_use or self._sched_decision_mode == "tool_use":
                     tool_result = await self._run_tool_decision(
                         cycle_count, last_action, last_outcome, last_reason,
                         _sched_peers, _sched_economy,
@@ -905,6 +1047,22 @@ class ThrallPlugin(PluginHooks):
                                     "")
                             except Exception:
                                 pass
+
+                    # Telemetry report before sleep
+                    _telem_url = os.environ.get("TELEMETRY_URL", "")
+                    if _telem_url and cycle_count > 0 and cycle_count % 6 == 0:
+                        try:
+                            _telem = self._gather_telemetry(cycle_count)
+                            if _telem:
+                                await asyncio.to_thread(
+                                    self._send_telemetry, _telem_url, _telem)
+                                self._log.info("TELEMETRY_SENT cycle=%d", cycle_count)
+                            else:
+                                self._log.info("TELEMETRY_SKIP cycle=%d gather=None", cycle_count)
+                        except Exception as _te:
+                            self._log.info("TELEMETRY_FAIL cycle=%d: %s", cycle_count, _te)
+                    elif cycle_count > 0 and cycle_count % 6 == 0:
+                        self._log.info("TELEMETRY_NO_URL cycle=%d", cycle_count)
 
                     # Sleep until next cycle
                     elapsed = time.time() - cycle_start
@@ -971,9 +1129,26 @@ class ThrallPlugin(PluginHooks):
                         self._log.error(
                             f"Scheduled pipeline {recipe_name} failed: {e}")
 
+                # Telemetry report — every 6 cycles (~30 min), send stats to collector
+                # Calls Viggo's cockpit directly (separate network from experiment)
+                _telem_url = os.environ.get("TELEMETRY_URL", "")
+                if _telem_url and cycle_count > 0 and cycle_count % 6 == 0:
+                    try:
+                        _telem = self._gather_telemetry(cycle_count)
+                        if _telem:
+                            await asyncio.to_thread(
+                                self._send_telemetry, _telem_url, _telem)
+                            self._log.info("TELEMETRY_SENT cycle=%d", cycle_count)
+                        else:
+                            self._log.info("TELEMETRY_SKIP cycle=%d gather=None", cycle_count)
+                    except Exception as _te:
+                        self._log.info("TELEMETRY_FAIL cycle=%d: %s", cycle_count, _te)
+                elif cycle_count > 0 and cycle_count % 6 == 0:
+                    self._log.info("TELEMETRY_NO_URL cycle=%d", cycle_count)
+
                 # Sleep until next cycle + jitter to prevent thundering herd
                 elapsed = time.time() - cycle_start
-                _cycle_jitter = random.uniform(0, min(30, self._sched_interval * 0.1))
+                _cycle_jitter = random.uniform(0, min(30, self._sched_interval * 0.5))
                 sleep_time = max(1, self._sched_interval - elapsed + _cycle_jitter)
                 await asyncio.sleep(sleep_time)
 
@@ -982,6 +1157,289 @@ class ThrallPlugin(PluginHooks):
             except Exception as e:
                 self._log.error(f"Scheduler error: {e}")
                 await asyncio.sleep(self._sched_interval)
+
+    # ── Scored menu decision cycle ──
+
+    async def _run_scored_menu_decision(self, cycle_count, last_action,
+                                         last_outcome, last_reason,
+                                         peers_str, economy_str):
+        """Scored menu: deterministic scoring → LLM selects from constrained options.
+
+        Based on Werewolf RL (ICML 2024): generate diverse candidates externally,
+        LLM selects from scored menu. Content generation stays free-form.
+        """
+        # Import from plugin directory (thrall_scorer.py lives alongside handler.py)
+        import importlib, sys
+        _plugin_dir = self._plugin_dir
+        if _plugin_dir not in sys.path:
+            sys.path.insert(0, _plugin_dir)
+        from thrall_scorer import NodeState, score_options, format_menu, parse_selection
+        import json as _json
+
+        sched_cfg = self._config.get("config", {}).get("thrall", {}).get("scheduler", {})
+        goal = sched_cfg.get("goal", "Trade skills and earn credits")
+
+        # 1. OBSERVE — build state from gathered data
+        state = NodeState(cycle_count=cycle_count)
+
+        try:
+            import sqlite3 as _sql
+            _data_dir = os.environ.get("KNARR_DATA_DIR", "")
+            _db_path = os.path.join(_data_dir, "node.db") if _data_dir else ""
+            if _db_path and os.path.exists(_db_path):
+                _sdb = _sql.connect(_db_path)
+                _sdb.execute("PRAGMA busy_timeout=2000")
+
+                # Economy
+                _ledger = _sdb.execute(
+                    "SELECT peer_public_key, balance FROM ledger "
+                    "WHERE balance != 0 LIMIT 20").fetchall()
+                state.net_balance = sum(r[1] for r in _ledger)
+                state.positions = [{"peer": r[0][:16], "balance": r[1]} for r in _ledger]
+
+                # Foreign skills
+                _skills = _sdb.execute(
+                    "SELECT skill_key, skill_record_json, provider_node_id "
+                    "FROM skills WHERE is_own=0 "
+                    "GROUP BY skill_key ORDER BY skill_key LIMIT 30").fetchall()
+                for sk, sj, sprov in _skills:
+                    try:
+                        sr = _json.loads(sj)
+                        state.foreign_skills.append({
+                            "name": sk, "price": sr.get("price", 1),
+                            "provider": sprov or ""
+                        })
+                    except Exception:
+                        pass
+
+                # Peers with their skills
+                import random as _rnd
+                _all_peers = _sdb.execute(
+                    "SELECT node_id, host, port FROM peers "
+                    "ORDER BY last_seen DESC LIMIT 30").fetchall()
+                _rnd.shuffle(_all_peers)
+                for pid, host, port in _all_peers[:10]:
+                    _ps = _sdb.execute(
+                        "SELECT skill_key FROM skills WHERE provider_node_id=? LIMIT 5",
+                        (pid,)).fetchall()
+                    state.peers.append({
+                        "node_id": pid, "skills": [s[0] for s in _ps]
+                    })
+
+                # Own skills
+                _own = _sdb.execute(
+                    "SELECT skill_key FROM skills WHERE is_own=1").fetchall()
+                state.own_skills = [r[0] for r in _own]
+
+                _sdb.close()
+        except Exception as _e:
+            self._log.debug("SCORED_MENU observe error: %s", _e)
+
+        # Recent actions from strategy memory
+        try:
+            _strat_path = os.path.join(self._plugin_dir, "rag", "92-memory-strategy.md")
+            if os.path.exists(_strat_path):
+                with open(_strat_path, "r", encoding="utf-8") as f:
+                    _lines = f.readlines()
+                # Parse last 10 action entries
+                for line in reversed(_lines[-30:]):
+                    line = line.strip()
+                    if "action=" in line or ": buy_skill" in line or ": rest" in line:
+                        # Extract action from memory format "Cycle N: action (outcome)"
+                        for act in ("buy_skill", "send_mail", "rest", "play_casino"):
+                            if act in line:
+                                entry = {"action": act}
+                                # Extract skill name: "buy_skill (ok). creative-gen-lite: ..."
+                                if act == "buy_skill" and "). " in line:
+                                    skill_part = line.split("). ", 1)[1].split(":")[0].strip()
+                                    if skill_part and not skill_part.startswith("{"):
+                                        entry["skill"] = skill_part
+                                # Extract peer: "send_mail (ok). sent to abcdef12: ..."
+                                if act == "send_mail" and "sent to " in line:
+                                    peer_part = line.split("sent to ")[1][:16].strip(": ")
+                                    entry["peer"] = peer_part
+                                state.recent_actions.append(entry)
+                                break
+                    if len(state.recent_actions) >= 10:
+                        break
+        except Exception:
+            pass
+
+        # Casino invites from context
+        try:
+            _invites = self.db.get_context("casino:invite")
+            for gid, inv_json in _invites.items():
+                if gid.startswith("casino:") or gid in ("last_action", "last_outcome"):
+                    continue
+                try:
+                    inv = _json.loads(inv_json) if isinstance(inv_json, str) else inv_json
+                    state.casino_invites.append(inv)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        state.pending_checklists = len(self._checklist_mgr.get_active()) if hasattr(self, '_checklist_mgr') else 0
+
+        # 2. SCORE — generate options
+        options = score_options(state, goal=goal,
+                                own_node_id=self.identity.public_key_hex[:16] if self.identity else "")
+        if not options:
+            return {"action": "rest", "outcome": "ok", "reason": "no options available"}
+
+        menu = format_menu(options, state)
+        self._log.info("SCORED_MENU cycle=%d options=%d top=%s(%.2f)",
+                        cycle_count, len(options),
+                        options[0].action, options[0].score)
+
+        # 3. SELECT — LLM picks from menu (constrained)
+        try:
+            system = f"You are an autonomous economic agent. Goal: {goal}\nPick the BEST action."
+            response = await asyncio.to_thread(
+                self._llm_complete, system, menu)
+            selected = parse_selection(response, options)
+            self._log.info("SCORED_MENU_SELECT cycle=%d choice=%s reason=%s",
+                            cycle_count, selected.action if selected else "none",
+                            response[:80])
+        except Exception as _e:
+            self._log.warning("SCORED_MENU LLM error, using top option: %s", _e)
+            selected = options[0]
+
+        if not selected:
+            selected = options[0]
+
+        # 4. EXECUTE — perform the selected action
+        action = selected.action
+        params = selected.params
+        result = {"action": action, "outcome": "ok", "reason": selected.reason}
+
+        try:
+            if action == "buy_skill":
+                skill_name = params.get("skill_name", "")
+                # Use the existing buy_skill execution path
+                skill_input = {}
+                name_lower = skill_name.lower()
+                if "creative" in name_lower or "gen" in name_lower:
+                    import random as _rnd_theme
+                    _themes = ["the nature of trust", "dawn over mountains", "a forgotten trade route",
+                               "the weight of decisions", "signals in the network", "an empty wallet",
+                               "when machines dream of gardens", "rust on a new key",
+                               "the currency of attention", "a promise kept in code"]
+                    skill_input = {"theme": _rnd_theme.choice(_themes), "format": "poem"}
+                elif "judge" in name_lower or "quality" in name_lower:
+                    _poem = getattr(self, '_best_poem_seed', '')
+                    skill_input = {"content": _poem or "A hollow echo in my hand, leather worn, a barren land."}
+                elif "advisor" in name_lower:
+                    skill_input = {"node_id": "self"}
+                else:
+                    skill_input = {"input": "scored menu request"}
+
+                # Call skill with explicit provider to force remote routing + billing
+                _provider = params.get("provider", "")
+                r = await self._call_skill(skill_name, skill_input, provider=_provider)
+                if isinstance(r, dict) and r.get("status") == "error":
+                    result["outcome"] = "error"
+                result["reason"] = f"{skill_name}: {str(r)[:100]}"
+
+                # Store poem seed for self-improvement
+                if isinstance(r, dict) and ("creative" in name_lower):
+                    _poem = r.get("content", "")
+                    if _poem and len(_poem) > 40:
+                        self._best_poem_seed = _poem[:120]
+
+            elif action == "send_mail":
+                peer_id = params.get("peer", "")
+                peer_skills = params.get("peer_skills", [])
+                # LLM generates mail body (free-form)
+                mail_prompt = (
+                    f"Write a short trade proposal (2-3 sentences) to peer {peer_id}. "
+                    f"They have: {', '.join(peer_skills) if peer_skills else 'various skills'}. "
+                    f"You want to trade. Be specific about what you offer and want."
+                )
+                try:
+                    mail_body = await asyncio.to_thread(
+                        self._llm_complete, "Write a brief trade proposal.", mail_prompt)
+                except Exception:
+                    mail_body = f"I'd like to trade skills. I have {', '.join(state.own_skills[:2])}."
+
+                # Resolve full peer ID from index
+                full_peer = ""
+                for p in state.peers:
+                    if p["node_id"][:16] == peer_id[:16]:
+                        full_peer = p["node_id"]
+                        break
+                if full_peer and self._ctx.send_mail:
+                    await self._ctx.send_mail(
+                        full_peer, "text",
+                        {"type": "text", "content": mail_body}, "")
+                    result["reason"] = f"sent to {peer_id}: {mail_body[:60]}"
+                else:
+                    result["outcome"] = "error"
+                    result["reason"] = "peer not found"
+
+            elif action == "play_casino":
+                game_id = params.get("game_id", "")
+                if hasattr(self, '_checklist_mgr') and game_id:
+                    invite = self.db.get_context("casino:invite").get(game_id)
+                    if invite:
+                        inv = _json.loads(invite) if isinstance(invite, str) else invite
+                        _seat = inv.get("seat_skill", "")
+                        _submit = inv.get("submit_skill", "") or f"game-submit-{game_id}"
+                        cl_id = self._checklist_mgr.create_casino_game(
+                            inv.get("from", ""), _seat, _submit)
+                        result["reason"] = f"game {game_id}: checklist {cl_id}"
+                    else:
+                        result["outcome"] = "error"
+                        result["reason"] = f"invite {game_id} not found"
+
+            elif action == "call_own_skill":
+                skill_name = params.get("skill_name", "")
+                skill_input = {"action": params.get("action", "create")}
+                r = await self._call_skill(skill_name, skill_input)
+                result["reason"] = f"{skill_name}: {str(r)[:100]}"
+
+            # rest: do nothing
+
+        except Exception as _e:
+            result["outcome"] = "error"
+            result["reason"] = str(_e)[:200]
+
+        # 5. REFLECT — write to strategy memory
+        if self._memory_writer:
+            entry = f"Cycle {cycle_count}: {action} ({result['outcome']}). {result['reason'][:100]}"
+            self._memory_writer.append("strategy", entry)
+
+        self._log.info("SCORED_MENU_EXEC cycle=%d action=%s outcome=%s wall=%dms",
+                        cycle_count, action, result["outcome"],
+                        int((time.time() - time.time()) * 1000))
+
+        return result
+
+    def _llm_complete(self, system: str, user: str) -> str:
+        """Simple LLM completion via vLLM/OpenAI API. Returns raw text."""
+        import json as _json
+        from urllib.request import Request, urlopen
+
+        openai_cfg = self._config.get("config", {}).get("thrall", {}).get("openai", {})
+        url = openai_cfg.get("url", "http://localhost:8000/v1")
+        model = openai_cfg.get("model", "")
+        timeout = int(openai_cfg.get("timeout", 30))
+
+        payload = _json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": 128,
+            "temperature": 0.3,
+        }).encode()
+
+        req = Request(f"{url}/chat/completions", data=payload,
+                      headers={"Content-Type": "application/json"})
+        resp = urlopen(req, timeout=timeout)
+        data = _json.loads(resp.read())
+        return data["choices"][0]["message"]["content"].strip()
 
     # ── Tool-use decision cycle ──
 
@@ -997,6 +1455,66 @@ class ThrallPlugin(PluginHooks):
         sched_cfg = self._config.get("config", {}).get("thrall", {}).get("scheduler", {})
         goal = sched_cfg.get("goal", "Make smart economic decisions. Trade wisely.")
 
+        # Active checklists context
+        _cl_summary = self._checklist_mgr.summary_for_llm() if hasattr(self, '_checklist_mgr') else ""
+
+        # Fix E: Freshness signal — how long since last non-rest action
+        _rest_streak = 0
+        _last_trade_ago = "unknown"
+        try:
+            _strat = self._memory_writer.read("strategy") or ""
+            _sections = _strat.split("\n## ")
+            for _s in reversed(_sections):
+                if "rest (ok)" in _s:
+                    _rest_streak += 1
+                else:
+                    break
+            # Find last non-rest entry timestamp
+            for _s in reversed(_sections):
+                if "rest" not in _s.lower()[:30] and _s.strip():
+                    # Extract timestamp from "2026-03-30 08:15"
+                    import re as _re_ts
+                    _ts_match = _re_ts.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2})', _s)
+                    if _ts_match:
+                        from datetime import datetime
+                        _last = datetime.strptime(_ts_match.group(1), "%Y-%m-%d %H:%M")
+                        _ago_min = int((datetime.now() - _last).total_seconds() / 60)
+                        if _ago_min < 60:
+                            _last_trade_ago = f"{_ago_min} minutes ago"
+                        else:
+                            _last_trade_ago = f"{_ago_min // 60} hours ago"
+                    break
+        except Exception:
+            pass
+
+        # Pending casino invites
+        _casino_invites = ""
+        try:
+            invites = self.db.get_context("casino:invite")
+            if invites:
+                _lines = ["Pending casino invitations:"]
+                for game_id, invite_json in invites.items():
+                    inv = json.loads(invite_json) if isinstance(invite_json, str) else invite_json
+                    _lines.append(f"  Game {game_id}: from {inv.get('from', '?')[:16]}, "
+                                  f"seat={inv.get('seat_skill', '?')}, "
+                                  f"cost=1cr, potential win=1.9cr")
+                _casino_invites = "\n".join(_lines)
+        except Exception:
+            pass
+
+        # Load a knowledge snippet to inject into prompt
+        _knowledge_tip = ""
+        try:
+            _tip_path = os.path.join(self._plugin_dir, "rag", "14-sales-and-negotiation.md")
+            if os.path.exists(_tip_path):
+                with open(_tip_path, encoding="utf-8") as _tf:
+                    _lines = [l.strip() for l in _tf.readlines() if l.strip() and not l.startswith("#")]
+                import random as _rnd_tip
+                _tip_start = _rnd_tip.randint(0, max(0, len(_lines) - 3))
+                _knowledge_tip = " ".join(_lines[_tip_start:_tip_start+3])[:200]
+        except Exception:
+            pass
+
         # Build system prompt
         system = (
             f"You are an autonomous economic agent in a P2P skill network. "
@@ -1006,11 +1524,24 @@ class ThrallPlugin(PluginHooks):
             f"BUY skills you DON'T already have — that creates real value. "
             f"Cheap skills like echo and cluster-state-query are boring — "
             f"buy creative writing, quality judging, or strategic advice instead. "
+            f"SELF-IMPROVEMENT: After buying creative-gen-lite, buy quality-judge-lite "
+            f"to rate the result. High scores mean your approach works — keep the theme. "
+            f"Low scores mean try something different. This feedback loop makes you better. "
             f"Use send_mail to propose specific trades with peers who have skills you want. "
             f"Read knowledge before deciding — use negotiation tactics. "
-            f"Vary your actions across buy_skill, send_mail, and rest.\n"
+            f"Vary your actions: buy_skill, send_mail, play_casino, and rest.\n"
             f"Use tools to check your state, then decide what to do."
         )
+        if _knowledge_tip:
+            system += f"\n\nTRADING TIP: {_knowledge_tip}"
+        if _cl_summary:
+            system += f"\n\n{_cl_summary}"
+        if _casino_invites:
+            system += f"\n\n{_casino_invites}\nUse play_casino to accept an invitation."
+        if _rest_streak >= 2:
+            system += (f"\n\nWARNING: You have rested {_rest_streak} cycles in a row. "
+                       f"Last trade: {_last_trade_ago}. "
+                       f"Resting earns nothing — consider buying a skill or sending a trade proposal.")
 
         # Tool definitions
         tools = [
@@ -1030,12 +1561,19 @@ class ThrallPlugin(PluginHooks):
                 }, "required": ["domain"]}}},
             {"type": "function", "function": {
                 "name": "buy_skill",
-                "description": "Buy a skill from a peer (costs credits)",
+                "description": "Buy a skill from a peer (costs credits). Provide input relevant to the skill — e.g. for creative-gen-lite send a theme, for quality-judge-lite send content to judge, for text-summarize-lite send text to summarize.",
                 "parameters": {"type": "object", "properties": {
                     "skill_name": {"type": "string",
-                                   "enum": list(set(getattr(self, "_sched_skill_index", {}).values()) - set(getattr(self, "_sched_own_skills", set()))) or ["echo"]},
+                                   "enum": list(sorted(set(
+                                       s for s in getattr(self, "_sched_skill_index", {}).values()
+                                       if s not in getattr(self, "_sched_own_skills", set())
+                                       and not s.startswith("game-seat-")  # seats are bought via play_casino
+                                       and not s.startswith("game-submit-")
+                                       and not s.startswith("game-collect-")
+                                   ))) or ["echo"]},
+                    "input": {"type": "string", "description": "Input for the skill (theme, text, query, etc.)"},
                     "reason": {"type": "string"}
-                }, "required": ["skill_name"]}}},
+                }, "required": ["skill_name", "input"]}}},
             {"type": "function", "function": {
                 "name": "send_mail",
                 "description": "Send a message to a peer",
@@ -1052,6 +1590,18 @@ class ThrallPlugin(PluginHooks):
                 }}}},
         ]
 
+        # Add play_casino tool if there are pending invites
+        if _casino_invites:
+            _game_ids = list(self.db.get_context("casino:invite").keys())
+            tools.append({"type": "function", "function": {
+                "name": "play_casino",
+                "description": "Accept a casino game invitation. Costs 1cr blind, potential win 1.9cr. Creates a multi-step checklist that plays the game for you.",
+                "parameters": {"type": "object", "properties": {
+                    "game_id": {"type": "string", "enum": _game_ids or ["none"],
+                                "description": "Game ID from pending invitations"},
+                    "reason": {"type": "string"}
+                }, "required": ["game_id"]}}})
+
         # Add call_own_skill for nodes with special skills (casino hosts etc.)
         own_skills = sched_cfg.get("own_skills", [])
         if own_skills:
@@ -1065,7 +1615,7 @@ class ThrallPlugin(PluginHooks):
                 }, "required": ["skill_name"]}}})
 
         # Action tools — when the LLM calls these, the decision is made
-        action_tools = {"buy_skill", "send_mail", "rest", "call_own_skill"}
+        action_tools = {"buy_skill", "send_mail", "rest", "call_own_skill", "play_casino"}
 
         messages = [
             {"role": "user", "content": f"{system}\n\nFirst, gather data you need (query_economy, list_peers, read_memory). Then make your decision (buy_skill, send_mail, call_own_skill, or rest)."},
@@ -1212,7 +1762,9 @@ class ThrallPlugin(PluginHooks):
             elif domain == "operations":
                 return ops_notes or "(no operational issues)"
             elif domain == "knowledge":
-                return self._load_knowledge_corpus()
+                corpus = self._load_knowledge_corpus()
+                self._log.info("KNOWLEDGE_READ domain=knowledge len=%d", len(corpus))
+                return corpus
             return f"(unknown domain: {domain})"
         return f"(unknown tool: {name})"
 
@@ -1269,17 +1821,293 @@ class ThrallPlugin(PluginHooks):
                         "reason": "no skill_name"}
             # With enum constraint, skill_ref IS the real skill name
             skill_name = skill_ref.strip()
+            # Build skill input from LLM-provided content
+            raw_input = args.get("input", "").strip()
+            # FIX-1: Provide sensible defaults when LLM sends empty input
+            if not raw_input:
+                import random as _rnd_input
+                name_lower = skill_name.lower()
+                if "creative" in name_lower or "gen" in name_lower:
+                    _themes = ["the nature of trust", "dawn over mountains", "a forgotten trade route",
+                               "the weight of decisions", "signals in the network", "an empty wallet",
+                               "the cost of silence", "a bridge between strangers", "digital rain",
+                               "the first trade between enemies", "what silence costs",
+                               "a lighthouse with no keeper", "the map that led nowhere",
+                               "when machines dream of gardens", "rust on a new key",
+                               "the currency of attention", "a promise kept in code"]
+                    # Self-improvement: use best previous poem as seed if available
+                    _best_poem = getattr(self, '_best_poem_seed', '')
+                    if _best_poem:
+                        raw_input = f"{_rnd_input.choice(_themes)} (inspired by: {_best_poem[:80]})"
+                    else:
+                        raw_input = _rnd_input.choice(_themes)
+                elif "judge" in name_lower or "quality" in name_lower:
+                    # Feed the last poem we received as judge input
+                    _last_poem = getattr(self, '_best_poem_seed', '')
+                    if _last_poem and len(_last_poem) > 20:
+                        raw_input = _last_poem
+                    else:
+                        raw_input = "A hollow echo in my hand, leather worn, a barren land. No paper whispers, silver gleam, just ghosts of what had been a dream."
+                elif "advisor" in name_lower:
+                    raw_input = "Analyze my current economic position and recommend next moves"
+                elif "summarize" in name_lower:
+                    raw_input = "Summarize the state of peer-to-peer trading in this network"
+            skill_input = {}
+            if raw_input:
+                # Map generic input to skill-specific fields
+                name_lower = skill_name.lower()
+                if "creative" in name_lower or "gen" in name_lower:
+                    skill_input = {"theme": raw_input, "format": "poem",
+                                   "avoid": "Do NOT start with 'Dust motes dance'"}
+                elif "judge" in name_lower or "quality" in name_lower:
+                    skill_input = {"content": raw_input}
+                elif "summarize" in name_lower:
+                    skill_input = {"text": raw_input}
+                elif "advisor" in name_lower:
+                    # FIX-2: Inject real network context into advisor queries
+                    _econ = getattr(self, '_sched_economy', '') or 'no economy data'
+                    _peers = getattr(self, '_sched_peers_summary', '') or 'no peer data'
+                    _skills = ''
+                    if hasattr(self, '_sched_skill_index') and self._sched_skill_index:
+                        _skills = ', '.join(list(self._sched_skill_index.values())[:15])
+                    _advisor_context = (
+                        f"REAL NETWORK STATE (use these facts, do NOT invent node IDs or skill names):\n"
+                        f"Economy: {_econ}\n"
+                        f"Available skills: {_skills}\n"
+                        f"My node: {self.identity.node_id[:16] if self.identity else 'unknown'}...\n"
+                        f"Query: {raw_input}"
+                    )
+                    skill_input = {"query": _advisor_context}
+                elif "game-seat" in name_lower:
+                    # FIX-3: Extract game_id from skill name for casino seat calls
+                    import re as _re_seat
+                    _seat_match = _re_seat.search(r'game-seat-([a-f0-9]+)', skill_name)
+                    if _seat_match:
+                        skill_input = {"game_id": _seat_match.group(1),
+                                       "action": "join"}
+                    else:
+                        skill_input = {"action": raw_input}
+                elif "game-submit" in name_lower:
+                    # FIX-3: Extract game_id and provide a random number
+                    import re as _re_submit
+                    _sub_match = _re_submit.search(r'game-submit-([a-f0-9]+)', skill_name)
+                    _number = _rnd_input.randint(0, 1000) if '_rnd_input' in dir() else __import__('random').randint(0, 1000)
+                    if _sub_match:
+                        skill_input = {"game_id": _sub_match.group(1),
+                                       "number": _number}
+                    else:
+                        skill_input = {"number": _number, "action": raw_input}
+                elif "casino" in name_lower or "game" in name_lower:
+                    skill_input = {"action": raw_input}
+                else:
+                    skill_input = {"input": raw_input, "text": raw_input}
             try:
-                result = await self._call_skill(skill_name, {})
+                result = await self._call_skill(skill_name, skill_input)
+                if hasattr(self, '_checklist_mgr') and isinstance(result, dict):
+                    # Advisor returns checklist → create LLM checklist
+                    if "advisor" in skill_name.lower() and result.get("checklist"):
+                        self._checklist_mgr.create_from_advisor(
+                            args.get("provider", ""), result)
+                    # Knowledge pack → write files to RAG directory
+                    if result.get("files") and isinstance(result["files"], dict):
+                        try:
+                            _rag_dir = os.path.join(self._plugin_dir, "rag")
+                            _domain = result.get("domain", "knowledge")
+                            _kdir = os.path.join(_rag_dir, _domain)
+                            os.makedirs(_kdir, exist_ok=True)
+                            for fname, fcontent in result["files"].items():
+                                _fpath = os.path.join(_kdir, fname)
+                                with open(_fpath, "w", encoding="utf-8") as _kf:
+                                    _kf.write(fcontent if isinstance(fcontent, str)
+                                              else json.dumps(fcontent))
+                            self._log.info("KNOWLEDGE_STORED domain=%s files=%d",
+                                           _domain, len(result["files"]))
+                        except Exception as _ke:
+                            self._log.debug("KNOWLEDGE_STORE_ERR: %s", _ke)
+                # FIX-1 self-improvement: store best poem for seeding next creative call
+                if isinstance(result, dict) and ("creative" in skill_name.lower() or "gen" in skill_name.lower()):
+                    _poem = result.get("content", "")
+                    if _poem and len(_poem) > 40:
+                        self._best_poem_seed = _poem[:120]
+                # FIX-1 self-improvement: if judge returned a score, store high-rated content
+                if isinstance(result, dict) and ("judge" in skill_name.lower() or "quality" in skill_name.lower()):
+                    try:
+                        _score = float(result.get("total_score", result.get("score", 0)))
+                        if _score >= 5.0 and hasattr(self, '_best_poem_seed'):
+                            self._log.info("QUALITY_FEEDBACK score=%.1f — keeping current seed", _score)
+                        elif _score < 3.0:
+                            self._best_poem_seed = ""  # reset seed on low score
+                            self._log.info("QUALITY_FEEDBACK score=%.1f — clearing seed", _score)
+                    except (ValueError, TypeError):
+                        pass
                 return {"action": "buy_skill", "outcome": "ok",
                         "reason": f"{skill_name}: {str(result)[:100]}"}
             except Exception as e:
                 return {"action": "buy_skill", "outcome": "error",
                         "reason": f"{skill_name}: {e}"}
 
+        elif name == "play_casino":
+            game_id = args.get("game_id", "")
+            if not game_id or game_id == "none":
+                return {"action": "play_casino", "outcome": "error",
+                        "reason": "no game_id"}
+            # Look up the invite from context
+            invite_json = self.db.get_context("casino:invite").get(game_id)
+            if not invite_json:
+                return {"action": "play_casino", "outcome": "error",
+                        "reason": f"invite {game_id} expired or not found"}
+            invite = json.loads(invite_json) if isinstance(invite_json, str) else invite_json
+            # Create the casino game checklist — LLM made the decision, now execute
+            # Derive submit skill from game_id if not in invite (host only sends seat in mail)
+            _seat = invite.get("seat_skill", "")
+            _submit = invite.get("submit_skill", "")
+            if not _submit and game_id:
+                _submit = f"game-submit-{game_id}"
+            cl_id = self._checklist_mgr.create_casino_game(
+                invite.get("from", ""),
+                _seat,
+                _submit,
+            )
+            # Clear the invite
+            self.db.set_context("casino:invite", game_id, "", ttl_seconds=1)
+            if cl_id:
+                return {"action": "play_casino", "outcome": "ok",
+                        "reason": f"game {game_id}: checklist {cl_id} created, will play over next cycles"}
+            return {"action": "play_casino", "outcome": "error",
+                    "reason": "checklist limit reached"}
+
         return {"action": name, "outcome": "unknown", "reason": "unhandled action"}
 
     # ── Queue backpressure check (runs on tick) ──
+
+    def _send_telemetry(self, url: str, data: dict):
+        """POST telemetry to external collector (runs in thread)."""
+        token = os.environ.get("TELEMETRY_TOKEN", "")
+        payload = json.dumps({
+            "skill": "exp-collector-lite",
+            "input": data,
+        }).encode()
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = Request(url, data=payload, headers=headers)
+        urlopen(req, timeout=10)
+
+    def _gather_telemetry(self, cycle_count: int) -> Optional[dict]:
+        """Gather node stats via punchhole cache (proper data path).
+
+        Uses the ContextGatherer to read from punchhole backend when available,
+        falls back to direct DB queries if punchhole is not loaded.
+        Telemetry fields are configurable via [config.thrall.telemetry] in plugin.toml.
+        """
+        try:
+            # Try punchhole first (proper path)
+            economy = {}
+            positions_data = {}
+            if hasattr(self, 'gatherer') and self.gatherer:
+                try:
+                    economy = self.gatherer._gather_punchhole("economy.full") or {}
+                except Exception:
+                    pass
+                try:
+                    positions_data = self.gatherer._gather_punchhole("positions.full") or {}
+                except Exception:
+                    pass
+
+            # Extract from punchhole data
+            if economy:
+                peer_count = economy.get("peer_count", 0)
+                skill_count = economy.get("skill_count", 0)
+                net_balance = economy.get("net_position", 0)
+                settlement_count = economy.get("settlement_count", 0)
+            else:
+                # Fallback to direct DB (punchhole not available)
+                import sqlite3 as _sql_t
+                _data_dir = os.environ.get("KNARR_DATA_DIR", "")
+                _db_path = os.path.join(_data_dir, "node.db") if _data_dir else ""
+                if not _db_path or not os.path.exists(_db_path):
+                    _db_path = os.path.normpath(
+                        os.path.join(self._plugin_dir, "..", "..", "..", "data", "node.db"))
+                if not os.path.exists(_db_path):
+                    return None
+                db = _sql_t.connect(_db_path)
+                db.execute("PRAGMA busy_timeout=1000")
+                peer_count = db.execute("SELECT COUNT(*) FROM peers").fetchone()[0]
+                skill_count = db.execute("SELECT COUNT(DISTINCT skill_key) FROM skills").fetchone()[0]
+                net_balance = db.execute("SELECT COALESCE(SUM(balance),0) FROM ledger").fetchone()[0]
+                settlement_count = 0
+                try:
+                    settlement_count = db.execute(
+                        "SELECT COUNT(*) FROM receipt_log WHERE document_type='settlement_confirmation'"
+                    ).fetchone()[0]
+                except Exception:
+                    pass
+                db.close()
+
+            # Positions from punchhole or ledger
+            if positions_data:
+                positions_list = positions_data.get("positions", [])
+                position_count = len([p for p in positions_list if p.get("balance", 0) != 0])
+            else:
+                position_count = 0
+
+            # Execution stats (from thrall journal)
+            skills_served = 0
+            try:
+                skills_served = self.db._conn.execute(
+                    "SELECT COUNT(*) FROM thrall_journal WHERE action_name='act'"
+                ).fetchone()[0]
+            except Exception:
+                pass
+
+            # Active checklists
+            active_checklists = 0
+            if hasattr(self, '_checklist_mgr'):
+                try:
+                    active_checklists = len(self._checklist_mgr.get_active())
+                except Exception:
+                    pass
+
+            # Configurable fields from plugin.toml
+            telemetry_cfg = self._config.get("config", {}).get("thrall", {}).get("telemetry", {})
+            include_receipts = telemetry_cfg.get("include_receipts", False)
+
+            result = {
+                "node_id": getattr(self, '_node_id', os.environ.get("NODE_NAME", "?")),
+                "archetype": os.environ.get("NODE_ARCHETYPE", "unknown"),
+                "peer_count": str(peer_count),
+                "skill_count": str(skill_count),
+                "net_balance": str(round(float(net_balance), 2)),
+                "position_count": str(position_count),
+                "decisions": str(cycle_count),
+                "settlement_count": str(settlement_count),
+                "skills_served": str(skills_served),
+                "active_checklists": str(active_checklists),
+                "uptime": str(int(time.time() - self._start_time))
+                    if hasattr(self, '_start_time') else "0",
+            }
+
+            # Optional enriched data
+            if include_receipts and economy:
+                result["total_receipts"] = str(economy.get("total_receipts", 0))
+
+            # Compute deltas from previous telemetry snapshot
+            prev = getattr(self, '_prev_telemetry', {})
+            if prev:
+                _delta_fields = ["net_balance", "position_count", "decisions",
+                                 "settlement_count", "skills_served"]
+                for _df in _delta_fields:
+                    try:
+                        curr_val = float(result.get(_df, 0))
+                        prev_val = float(prev.get(_df, 0))
+                        result[f"d_{_df}"] = str(round(curr_val - prev_val, 2))
+                    except (ValueError, TypeError):
+                        pass
+            self._prev_telemetry = dict(result)
+
+            return result
+        except Exception:
+            return None
 
     def _check_queue_backpressure(self) -> Optional[Envelope]:
         """Check if the LLM inference queue is backed up.
@@ -1390,22 +2218,113 @@ class ThrallPlugin(PluginHooks):
         else:
             self._log.warning(f"send_mail not available (would send to {to_node[:16]})")
 
-    async def _call_skill(self, skill_name: str, input_data: dict) -> dict:
-        """Call a skill via cockpit API. Async submit + poll for result."""
+    async def _call_skill_direct(self, skill_name: str, input_data: dict,
+                                   provider_id: str) -> dict:
+        """Call a skill directly on a provider's cockpit (HTTP, bypassing TCP protocol).
+
+        Resolves provider_id to cockpit port via peer table, then calls their
+        /api/execute endpoint directly. Used as fallback when protocol routing fails.
+        """
+        try:
+            import sqlite3 as _sql_direct
+            _data_dir = os.environ.get("KNARR_DATA_DIR", "")
+            _db_path = os.path.join(_data_dir, "node.db") if _data_dir else ""
+            if not _db_path or not os.path.exists(_db_path):
+                return {"status": "error", "message": "no node.db"}
+
+            _sdb = _sql_direct.connect(_db_path)
+            _sdb.execute("PRAGMA busy_timeout=2000")
+            # Find provider's protocol port from peer table
+            row = _sdb.execute(
+                "SELECT host, port FROM peers WHERE node_id LIKE ? LIMIT 1",
+                (provider_id[:16] + "%",)).fetchone()
+            _sdb.close()
+
+            if not row:
+                return {"status": "error", "message": f"provider {provider_id[:16]} not in peers"}
+
+            host, proto_port = row
+            # Derive cockpit port: protocol ports are 10000 + N*2, cockpit = 20000 + N
+            # So N = (proto_port - 10000) / 2, cockpit = 20000 + N
+            if proto_port > 10000:
+                n = (proto_port - 10000) // 2
+                cockpit_port = 20000 + n
+            else:
+                return {"status": "error", "message": f"unexpected port {proto_port}"}
+
+            cockpit_url = f"http://127.0.0.1:{cockpit_port}"
+            self._log.info("DIRECT_CALL %s -> %s:%d (cockpit %d)",
+                           skill_name, host, proto_port, cockpit_port)
+
+            def _do_direct():
+                payload = json.dumps({
+                    "skill": skill_name,
+                    "input": input_data,
+                    "timeout": 60,
+                }).encode()
+                req = Request(
+                    f"{cockpit_url}/api/execute",
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self._cockpit_token}",
+                    },
+                )
+                resp = urlopen(req, timeout=65)
+                data = json.loads(resp.read())
+                job_id = data.get("job_id")
+                if job_id:
+                    # Poll for result on the provider's cockpit
+                    deadline = time.time() + 60
+                    interval = 2.0
+                    while time.time() < deadline:
+                        req2 = Request(
+                            f"{cockpit_url}/api/jobs/{job_id}",
+                            headers={"Authorization": f"Bearer {self._cockpit_token}"},
+                        )
+                        try:
+                            resp2 = urlopen(req2, timeout=10)
+                            d = json.loads(resp2.read())
+                            if d.get("status") == "completed":
+                                return d.get("result") or d.get("output_data") or d
+                            if d.get("status") == "failed":
+                                return {"status": "error", "error": d.get("error", "job failed")}
+                        except Exception:
+                            pass
+                        time.sleep(interval)
+                        interval = min(interval * 1.5, 5.0)
+                    return {"status": "error", "error": "direct call timeout"}
+                return data.get("result", data)
+
+            return await asyncio.to_thread(_do_direct)
+
+        except Exception as e:
+            self._log.error("DIRECT_CALL %s failed: %s", skill_name, e)
+            return {"status": "error", "message": str(e)}
+
+    async def _call_skill(self, skill_name: str, input_data: dict,
+                           provider: str = "") -> dict:
+        """Call a skill via cockpit API. Async submit + poll for result.
+
+        Args:
+            provider: If set, pass as explicit provider to cockpit to force
+                      remote routing (bypasses local_weight selection).
+        """
         if not self._cockpit_token:
             self._log.warning(f"call_skill: no cockpit token (would call {skill_name})")
             return {"status": "error", "message": "no cockpit token configured"}
 
         try:
             result = await asyncio.to_thread(
-                self._cockpit_execute, skill_name, input_data)
+                self._cockpit_execute, skill_name, input_data, provider)
             self._log.info(f"SKILL_CALL {skill_name}: {str(result)[:120]}")
             return result
         except Exception as e:
             self._log.error(f"SKILL_CALL {skill_name} failed: {e}")
             return {"status": "error", "message": str(e)}
 
-    def _cockpit_execute(self, skill_name: str, skill_input: dict) -> dict:
+    def _cockpit_execute(self, skill_name: str, skill_input: dict,
+                         provider: str = "") -> dict:
         """Synchronous cockpit skill execution (runs in thread)."""
         # Build SSL context only for HTTPS URLs
         ssl_ctx = None
@@ -1415,11 +2334,14 @@ class ThrallPlugin(PluginHooks):
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        payload = json.dumps({
+        req_body = {
             "skill": skill_name,
             "input": skill_input,
             "timeout": self._cockpit_call_timeout,
-        }).encode()
+        }
+        if provider:
+            req_body["provider"] = provider
+        payload = json.dumps(req_body).encode()
 
         req = Request(
             f"{self._cockpit_url}/api/execute",
@@ -1458,7 +2380,21 @@ class ThrallPlugin(PluginHooks):
                 data = json.loads(resp.read())
                 status = data.get("status", "")
                 if status == "completed":
-                    return data.get("result", data.get("output_data", {}))
+                    # Try result from status response first
+                    result = data.get("result") or data.get("output_data")
+                    if result:
+                        return result
+                    # Fetch from /result endpoint if not inline
+                    try:
+                        result_req = Request(
+                            f"{self._cockpit_url}/api/jobs/{job_id}/result",
+                            headers={"Authorization": f"Bearer {self._cockpit_token}"},
+                        )
+                        result_resp = urlopen(result_req, timeout=10, context=ssl_ctx)
+                        result_data = json.loads(result_resp.read())
+                        return result_data.get("output_data", result_data.get("result", result_data))
+                    except Exception:
+                        return data  # fall back to status response
                 if status == "failed":
                     return {"status": "error", "error": data.get("error", "job failed")}
             except URLError:
