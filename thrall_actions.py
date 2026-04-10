@@ -356,14 +356,17 @@ class ActionExecutor:
         input_template = actions_cfg.get("input", {})
         skill_input = {}
         for k, v in input_template.items():
-            if isinstance(v, str) and v.startswith("{{") and v.endswith("}}"):
-                field_path = v[2:-2].strip()
-                if field_path.startswith("envelope."):
-                    skill_input[k] = envelope.get(field_path[9:], "")
-                elif field_path.startswith("eval."):
-                    skill_input[k] = getattr(eval_result, field_path[5:], "")
-                else:
-                    skill_input[k] = v
+            if isinstance(v, str) and "{{" in v:
+                # Resolve ALL embedded {{...}} templates in the string
+                import re as _re_tpl
+                def _resolve(m):
+                    field_path = m.group(1).strip()
+                    if field_path.startswith("envelope."):
+                        return str(envelope.get(field_path[9:], ""))
+                    elif field_path.startswith("eval."):
+                        return str(getattr(eval_result, field_path[5:], ""))
+                    return m.group(0)  # leave unresolved
+                skill_input[k] = _re_tpl.sub(r"\{\{(.+?)\}\}", _resolve, v)
             else:
                 skill_input[k] = v
 
