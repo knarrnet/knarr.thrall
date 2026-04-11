@@ -127,24 +127,31 @@ class ThrallDB:
             pass  # column already exists
         c.commit()
 
-        # Knowledge-as-a-Service (v3.10)
+        # Knowledge-as-a-Service (v3.10) + wing scoping (v3.11.1)
         c.executescript("""
             CREATE TABLE IF NOT EXISTS thrall_knowledge (
                 id          INTEGER PRIMARY KEY,
                 domain      TEXT NOT NULL,
+                wing        TEXT NOT NULL DEFAULT '',
                 source_file TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 chunk_text  TEXT NOT NULL,
+                section     TEXT NOT NULL DEFAULT '',
                 embedding   BLOB,
                 version     TEXT NOT NULL,
                 acquired_at TEXT NOT NULL,
-                UNIQUE(domain, source_file, chunk_index)
+                UNIQUE(wing, domain, source_file, chunk_index)
             );
             CREATE INDEX IF NOT EXISTS idx_knowledge_domain
                 ON thrall_knowledge(domain);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_wing
+                ON thrall_knowledge(wing);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_wing_domain
+                ON thrall_knowledge(wing, domain);
 
             CREATE TABLE IF NOT EXISTS thrall_knowledge_meta (
-                domain           TEXT PRIMARY KEY,
+                domain           TEXT NOT NULL,
+                wing             TEXT NOT NULL DEFAULT '',
                 version          TEXT NOT NULL,
                 description      TEXT,
                 author_node      TEXT,
@@ -154,11 +161,13 @@ class ThrallDB:
                 file_count       INTEGER,
                 chunk_count      INTEGER,
                 ingestion_status TEXT DEFAULT 'pending',
-                embedding_model  TEXT DEFAULT ''
+                embedding_model  TEXT DEFAULT '',
+                retrieval_mode   TEXT DEFAULT '',
+                PRIMARY KEY (wing, domain)
             );
         """)
 
-        # FTS5 fallback index — always created
+        # FTS5 index — always created
         try:
             c.executescript("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS thrall_knowledge_fts
@@ -169,6 +178,19 @@ class ThrallDB:
             """)
         except Exception as e:
             logger.warning(f"FTS5 index creation failed: {e}")
+
+        # Migration: add columns to existing knowledge tables (idempotent)
+        for tbl, col, default in [
+            ("thrall_knowledge", "wing", "''"),
+            ("thrall_knowledge", "section", "''"),
+            ("thrall_knowledge_meta", "wing", "''"),
+            ("thrall_knowledge_meta", "retrieval_mode", "''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT DEFAULT {default}")
+                c.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     # ── Journal ──
 

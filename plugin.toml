@@ -1,5 +1,5 @@
 name = "knarr-thrall"
-version = "3.11.0"
+version = "3.11.1"
 handler = "handler:ThrallPlugin"
 
 [config]
@@ -59,10 +59,17 @@ max_domains = 50
 max_chunks_per_domain = 500
 max_pack_bytes = 5242880      # 5MB
 embedding_source = "l1"       # "l1" (reuse L1 model) | "dedicated"
+retrieval_mode = "auto"       # fts | vec | hybrid | rerank | auto
+embed_model = ""              # ollama embedding model (e.g., "nomic-embed-text")
+embed_url = ""                # ollama URL (default: same as backend URL)
+rrf_k = 60                    # RRF constant (higher = more weight to lower ranks)
+rerank_candidates = 20        # FTS candidates for rerank step
+wing = ""                     # identity namespace (empty = single-identity mode)
 
 # Per-domain overrides (example):
 # [config.thrall.knowledge.overrides.casino]
 # trust_level = "trusted"
+# retrieval_mode = "hybrid"
 
 [config.thrall.trust_tiers]
 team = []                         # 16-char hex prefix of YOUR other nodes
